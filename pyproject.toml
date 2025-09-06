@@ -1,0 +1,135 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warped-mppi"
+version = "0.1.0"
+description = "High-performance Model Predictive Path Integral (MPPI) control using NVIDIA Warp"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "barry.gilhuly@uwaterloo.ca"}
+]
+maintainers = [
+    {name = "Your Name", email = "barry.gilhuly@uwaterloo.ca"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+keywords = ["MPPI", "model predictive control", "autonomous vehicles", "GPU acceleration", "NVIDIA Warp", "robotics", "path planning"]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "warp-lang>=1.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "black",
+    "isort",
+    "mypy",
+    "flake8",
+]
+examples = [
+    "matplotlib>=3.5.0",
+    "jupyter",
+    "ipywidgets",
+]
+legacy = [
+    "pycuda>=2022.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/idlebear/warped-mppi"
+Repository = "https://github.com/idlebear/warped-mppi.git"
+Documentation = "https://warped-mppi.readthedocs.io/"
+"Bug Tracker" = "https://github.com/idlebear/warped-mppi/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["warped_mppi*", "example*"]
+exclude = ["tests*", "cpp_legacy*"]
+
+[tool.setuptools.package-data]
+warped_mppi = ["*.py"]
+example = ["*.py"]
+
+[tool.black]
+line-length = 88
+target-version = ['py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+  | cpp_legacy
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+skip_gitignore = true
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "pycuda.*",
+    "warp.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--verbose",
+    "--cov=warped_mppi",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: marks tests that require GPU",
+]
