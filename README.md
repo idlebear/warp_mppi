@@ -145,7 +145,9 @@ This implementation supports research in:
 
 If you use this work in your research, please cite:
 ```
-Gilhuly, Barry, Armin Sadeghi, and Stephen L. Smith. "Estimating Visibility From Alternate Perspectives for Motion Planning With Occlusions." *IEEE Robotics and Automation Letters* 9.6 (2024): 5583-5590.
+Gilhuly, Barry, Armin Sadeghi, and Stephen L. Smith.
+"Estimating Visibility From Alternate Perspectives for Motion Planning With Occlusions."
+IEEE Robotics and Automation Letters 9.6 (2024): 5583-5590.
 ```
 
 ## License
