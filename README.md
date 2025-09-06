@@ -4,19 +4,23 @@ A GPU-accelerated implementation of Model Predictive Path Integral (MPPI) contro
 
 ## Overview
 
-This repository contains a high-performance implementation of MPPI control algorithm originally implemented with PyCUDA, now being converted to use NVIDIA Warp for better performance and maintainability. The controller is designed for autonomous vehicle navigation with visibility-aware path planning and dynamic obstacle avoidance.
+This repository contains a high-performance implementation of MPPI control algorithm originally implemented with PyCUDA, now converted to use NVIDIA Warp for better performance and maintainability. The controller is designed for autonomous vehicle navigation with visibility-aware path planning and dynamic obstacle avoidance.
+
+For the time being, the visibility-aware portion is undocumented.  Use method='Nominal' for basic MPPI with obstacle avoidance.
 
 ## Core Functionality
 
-### MPPI Controller (`mppi_pycuda.py` - Legacy Implementation)
+### MPPI Controller 
 
-The original MPPI implementation provides:
+The MPPI implementation provides:
 
 - **GPU-Accelerated Sampling**: Monte Carlo sampling of control sequences with configurable sample counts
 - **Multiple Cost Functions**: Support for various visibility and information-theoretic cost functions
 - **Dynamic Obstacle Avoidance**: Real-time collision avoidance with circular obstacles
 - **Vehicle Dynamics**: Bicycle model integration using Runge-Kutta methods
 - **Flexible Cost Weighting**: Configurable weights for state tracking, control effort, and safety costs
+
+A PyCuda-based version is available in the legacy folder.  It has the complete implementation in CUDA, and is kept for reference/posterity. 
 
 ### Key Features
 
@@ -57,15 +61,6 @@ The original MPPI implementation provides:
 - **Scalable**: Configurable sample counts (typically 1000-10000 samples)
 - **Memory Efficient**: Minimal host-device transfers and persistent GPU memory
 
-## Migration to NVIDIA Warp
-
-This codebase is being converted from PyCUDA to NVIDIA Warp to leverage:
-
-- **Simplified GPU Programming**: Python-native GPU kernel development
-- **Better Performance**: Optimized compilation and execution
-- **Modern Architecture**: Support for latest GPU architectures
-- **Improved Debugging**: Better tooling and error reporting
-
 ## Installation
 
 ### Prerequisites
@@ -73,7 +68,6 @@ This codebase is being converted from PyCUDA to NVIDIA Warp to leverage:
 - Python 3.12+
 - NVIDIA GPU with CUDA support
 - warp_lang package  (tested with version 1.9.0)
-
 
 ### Environment Setup
 
