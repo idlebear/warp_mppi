@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "warped-mppi"
+name = "warp_mppi"
 version = "0.1.0"
 description = "High-performance Model Predictive Path Integral (MPPI) control using NVIDIA Warp"
 readme = "README.md"
@@ -50,18 +50,18 @@ legacy = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/idlebear/warped-mppi"
-Repository = "https://github.com/idlebear/warped-mppi.git"
-Documentation = "https://warped-mppi.readthedocs.io/"
-"Bug Tracker" = "https://github.com/idlebear/warped-mppi/issues"
+Homepage = "https://github.com/idlebear/warp_mppi"
+Repository = "https://github.com/idlebear/warp_mppi.git"
+Documentation = "https://warp_mppi.readthedocs.io/"
+"Bug Tracker" = "https://github.com/idlebear/warp_mppi/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["warped_mppi*", "example*"]
+include = ["warp_mppi*", "example*"]
 exclude = ["tests*", "cpp_legacy*"]
 
 [tool.setuptools.package-data]
-warped_mppi = ["*.py"]
+warp_mppi = ["*.py"]
 example = ["*.py"]
 
 [tool.black]
@@ -124,7 +124,7 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "--verbose",
-    "--cov=warped_mppi",
+    "--cov=warp_mppi",
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",

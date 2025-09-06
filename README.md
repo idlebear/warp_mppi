@@ -1,4 +1,4 @@
-# Warped MPPI: High-Performance Model Predictive Path Integral Control
+# Warp MPPI: High-Performance Model Predictive Path Integral Control
 
 A GPU-accelerated implementation of Model Predictive Path Integral (MPPI) control using NVIDIA Warp for autonomous vehicle navigation and obstacle avoidance.
 
@@ -85,7 +85,7 @@ pip install -e .    # Install as editable package
 ## Usage
 
 ```python
-from warped_mppi import MPPI
+from warp_mppi import MPPI
 
 # Initialize controller
 controller = MPPI(

@@ -3,7 +3,7 @@ Basic tests for the MPPI controller.
 """
 
 import pytest
-from warped_mppi import MPPI
+from warp_mppi import MPPI
 
 
 class TestMPPI:

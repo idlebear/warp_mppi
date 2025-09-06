@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Setup script for warped-mppi package.
+Setup script for warp_mppi package.
 
 This file exists primarily for backward compatibility and development installs.
 The main package configuration is in pyproject.toml.

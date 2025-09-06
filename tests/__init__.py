@@ -1,1 +1,1 @@
-"""Tests for the warped_mppi package."""
+"""Tests for the warp_mppi package."""
