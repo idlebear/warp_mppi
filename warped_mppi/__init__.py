@@ -5,23 +5,35 @@ A GPU-accelerated implementation of MPPI control using NVIDIA Warp for
 autonomous vehicle navigation and obstacle avoidance.
 """
 
-from .mppi_pycuda import MPPI
+"""
+Warped MPPI: High-Performance Model Predictive Path Integral Control
 
-# Try to import Warp implementation if available
+A GPU-accelerated implementation of MPPI control using NVIDIA Warp for
+autonomous vehicle navigation and obstacle avoidance.
+"""
+
+"""
+Warped MPPI: High-Performance Model Predictive Path Integral Control
+
+A GPU-accelerated implementation of MPPI control using NVIDIA Warp for
+autonomous vehicle navigation and obstacle avoidance.
+"""
+
+# Primary Warp-based implementation
 try:
-    from .mppi_warp import WarpMPPI
+    from .mppi_warp import WarpMPPI, MPPI
 
     WARP_AVAILABLE = True
-except ImportError:
-    WarpMPPI = None
+except ImportError as e:
+    MPPI = None
     WARP_AVAILABLE = False
+    raise ImportError(f"Warp not available - cannot import MPPI controller: {e}")
+
+# Legacy PyCUDA implementation available on explicit import
+# from warped_mppi.legacy import PyCudaMPPI
 
 __version__ = "0.1.0"
-__author__ = "Your Name"
-__email__ = "your.email@example.com"
+__author__ = "Barry Gilhuly"
+__email__ = "barry.gilhuly@uwaterloo.ca"
 
-__all__ = ["MPPI"]
-
-# Add WarpMPPI to exports if available
-if WARP_AVAILABLE:
-    __all__.append("WarpMPPI")
+__all__ = ["MPPI", "WarpMPPI"]
