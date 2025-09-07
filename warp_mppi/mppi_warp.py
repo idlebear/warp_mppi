@@ -153,16 +153,6 @@ def obstacle_cost(
         min_dist = obstacle.radius + vehicle_radius
 
         if d_sq < min_dist * min_dist:
-            # wp.printf(
-            #     "Collision with obstacle %d at position (%.2f, %.2f), distance %.2f, min_distance %.2f, ego at (%.2f, %.2f)\n",
-            #     i,
-            #     obstacle.x,
-            #     obstacle.y,
-            #     wp.sqrt(d_sq),
-            #     min_dist,
-            #     px,
-            #     py,
-            # )
             return COLLISION_PENALTY  # Large penalty for collision
 
     return 0.0
@@ -217,8 +207,8 @@ def andersen_cost(
 
     for i in range(num_obstacles):
         obstacle = obstacles[i]
-        dx = obstacle.min_x - px
-        dy = obstacle.min_y - py
+        dx = obstacle.x - px
+        dy = obstacle.y - py
 
         # Check if the obstacle is in front of the vehicle
         dot = dx * vx + dy * vy
@@ -634,7 +624,6 @@ class WarpMPPI:
         vehicle=None,  # For compatibility
         samples: int = 1000,
         seed: int = None,
-        vehicle_length: float = 2.5,
         u_limits: List[float] = [3.0, 0.5],
         u_dist_limits: List[float] = [0.5, 0.1],
         Q: List[float] = [1.0, 1.0, 0.1, 0.1],
@@ -657,7 +646,7 @@ class WarpMPPI:
         self.params = OptimizationParams()
         self.params.samples = samples
         self.params.M = M
-        self.params.vehicle_length = vehicle_length
+        self.params.vehicle_length = vehicle.L if vehicle else 1.0
         self.params.c_lambda = c_lambda
         self.params.scan_range = scan_range
         self.params.steering_rate_weight = steering_rate_weight
@@ -772,8 +761,8 @@ class WarpMPPI:
             obstacle.x = actor[0]
             obstacle.y = actor[1]
             obstacle.radius = actor[2]
-            obstacle.min_x = actor[0]
-            obstacle.min_y = actor[1]
+            obstacle.min_x = 0
+            obstacle.min_y = 0
             obstacle.distance = 0.0
             obstacles_list.append(obstacle)
         obstacles_wp = wp.array(obstacles_list, dtype=Obstacle, device=self.device)
@@ -812,8 +801,8 @@ class WarpMPPI:
             device=self.device,
         )
 
-        # # Ensure GPU kernel completes before continuing
-        # wp.synchronize_device(self.device)
+        # Ensure GPU kernel completes before continuing
+        wp.synchronize_device(self.device)
 
         # Find minimum cost
         min_cost_wp = wp.zeros(1, dtype=wp.float32, device=self.device)
