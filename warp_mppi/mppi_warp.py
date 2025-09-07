@@ -20,6 +20,8 @@ ANDERSEN = 2
 NO_VISIBILITY = 3
 INFO_GAIN_LIKE = 4
 
+COLLISION_PENALTY = 1e7
+
 
 # Warp data structures
 @wp.struct
@@ -151,7 +153,7 @@ def obstacle_cost(
         min_dist = obstacle.radius + vehicle_radius
 
         if d_sq < min_dist * min_dist:
-            return 1e7  # Large penalty for collision
+            return COLLISION_PENALTY  # Large penalty for collision
 
     return 0.0
 
@@ -238,7 +240,7 @@ def our_cost(
 
     # Bounds checking
     if map_x < 0 or map_x >= width or map_y < 0 or map_y >= height:
-        return 1e7  # Large penalty for out of bounds
+        return COLLISION_PENALTY  # Large penalty for out of bounds
 
     # Sample costmap value
     cost_value = costmap[map_y, map_x]
@@ -266,23 +268,33 @@ def pcg_hash(input: wp.uint32) -> wp.uint32:
     return (word >> wp.uint32(22)) ^ word
 
 
-@wp.func
-def random_uniform(rng_state: wp.uint32) -> wp.float32:
-    """Generate uniform random number in [0, 1)."""
-    return wp.float32(pcg_hash(rng_state)) / wp.float32(0xFFFFFFFF)
+@wp.struct
+class RngState:
+    """Wrapper for RNG state to enable pass-by-reference semantics."""
+
+    state: wp.uint32
 
 
 @wp.func
-def random_normal(
-    rng_state: wp.uint32, mean: wp.float32, std: wp.float32
-) -> wp.float32:
-    """Generate normal random number using Box-Muller transform."""
-    u1 = random_uniform(rng_state)
-    u2 = random_uniform(rng_state + wp.uint32(1))
+def random_uniform(rng: RngState) -> wp.float32:
+    """Generate uniform random number in [0, 1) and advance state."""
+    rng.state = pcg_hash(rng.state)
+    return wp.float32(rng.state) / wp.float32(0xFFFFFFFF)
+
+
+@wp.func
+def random_normal(rng: RngState, mean: wp.float32, std: wp.float32) -> wp.float32:
+    """Generate normal random number using Box-Muller transform and advance state."""
+    # Get first uniform sample
+    u1 = random_uniform(rng)
+
+    # Get second uniform sample
+    u2 = random_uniform(rng)
 
     # Ensure u1 > 0 to avoid log(0)
     u1 = wp.max(u1, 1e-8)
 
+    # Box-Muller transform
     z0 = wp.sqrt(-2.0 * wp.log(u1)) * wp.cos(2.0 * wp.float32(wp.pi) * u2)
     return mean + std * z0
 
@@ -322,17 +334,24 @@ def mppi_rollout_kernel(
         return
 
     # Initialize random state
-    rng_state = rand_states[sample_idx]
+    rng = RngState()
+    rng.state = rand_states[sample_idx]
 
     # Generate control disturbances for this sample
     for ctrl_idx in range(params.num_controls):
-        rng_state = pcg_hash(rng_state)
-        a_noise = random_normal(rng_state, 0.0, limits.u_dist_limits[0])
+        # Generate acceleration noise and update RNG state
+        a_noise = random_normal(rng, 0.0, limits.u_dist_limits[0] / 4.0)
 
-        rng_state = pcg_hash(rng_state)
-        delta_noise = random_normal(rng_state, 0.0, limits.u_dist_limits[1])
+        # Generate steering noise and update RNG state
+        delta_noise = random_normal(rng, 0.0, limits.u_dist_limits[1] / 4.0)
 
-        # Apply disturbance and clamp to limits
+        # Clamp noise to disturbance limits first
+        a_noise = wp.clamp(a_noise, -limits.u_dist_limits[0], limits.u_dist_limits[0])
+        delta_noise = wp.clamp(
+            delta_noise, -limits.u_dist_limits[1], limits.u_dist_limits[1]
+        )
+
+        # Apply disturbance and then clamp to control limits
         a_disturbed = wp.clamp(
             u_nominal[ctrl_idx].a + a_noise, -limits.u_limits[0], limits.u_limits[0]
         )
@@ -340,6 +359,18 @@ def mppi_rollout_kernel(
             u_nominal[ctrl_idx].delta + delta_noise,
             -limits.u_limits[1],
             limits.u_limits[1],
+        )
+
+        wp.printf(
+            "Sample %d, Control %d: a_nom=%.3f, a_dist=%.3f, a_dist_limit=%.3f, delta_nom=%.3f, delta_dist=%.3f, delta_dist_limit=%.3f\n",
+            sample_idx,
+            ctrl_idx,
+            u_nominal[ctrl_idx].a,
+            a_disturbed - u_nominal[ctrl_idx].a,
+            limits.u_dist_limits[0],
+            u_nominal[ctrl_idx].delta,
+            delta_disturbed - u_nominal[ctrl_idx].delta,
+            limits.u_dist_limits[1],
         )
 
         # Store disturbance (difference from nominal)
@@ -461,7 +492,7 @@ def mppi_rollout_kernel(
         )
 
         # Early termination for collision
-        if obstacle_cost_val > 1e6:
+        if total_cost >= COLLISION_PENALTY:
             break
 
     # Final state cost
@@ -482,12 +513,12 @@ def mppi_rollout_kernel(
 
     # Handle NaN/inf
     if wp.isnan(total_cost) or wp.isinf(total_cost):
-        total_cost = 1e8
+        total_cost = COLLISION_PENALTY
 
     costs[sample_idx] = total_cost
 
     # Update random state
-    rand_states[sample_idx] = rng_state
+    rand_states[sample_idx] = rng.state
 
 
 # Weight computation kernels
@@ -525,9 +556,13 @@ def compute_weights_kernel(
     lambda_safe = wp.max(c_lambda, 1e-6)
 
     # Convert cost to weight
-    diff = (costs[tid] - min_cost[0]) / lambda_safe
-    diff = wp.clamp(diff, 0.0, 60.0)  # Avoid underflow
-    weight = wp.exp(-diff)
+    # If the cost includes a large collision penalty, zero it out
+    if costs[tid] >= COLLISION_PENALTY:
+        weight = 0.0
+    else:
+        diff = (costs[tid] - min_cost[0]) / lambda_safe
+        diff = wp.clamp(diff, 0.0, 60.0)  # Avoid underflow
+        weight = wp.exp(-diff)
 
     if wp.isnan(weight):
         weight = 0.0
@@ -779,6 +814,20 @@ class WarpMPPI:
             inputs=[costs_wp, min_cost_wp],
             device=self.device,
         )
+
+        min_cost = min_cost_wp.numpy()[0]
+        if np.isnan(min_cost) or min_cost >= COLLISION_PENALTY:
+            # All trajectories are invalid
+            if self.debug:
+                print("[WarpMPPI] All trajectories invalid, returning zeros")
+            u_optimal = np.zeros((len(u_nom), 2), dtype=np.float32)
+            u_samples = np.zeros((self.samples, len(u_nom), 2), dtype=np.float32)
+            u_weights = np.zeros(self.samples, dtype=np.float32)
+            self.last_ess = 0.0
+            self.last_cost_min = float("nan")
+            self.last_cost_max = float("nan")
+            self.last_cost_mean = float("nan")
+            return u_optimal, u_samples, u_weights
 
         # Compute weights
         weights_wp = wp.zeros(self.samples, dtype=wp.float32, device=self.device)
