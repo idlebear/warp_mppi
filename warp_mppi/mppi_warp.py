@@ -153,6 +153,16 @@ def obstacle_cost(
         min_dist = obstacle.radius + vehicle_radius
 
         if d_sq < min_dist * min_dist:
+            # wp.printf(
+            #     "Collision with obstacle %d at position (%.2f, %.2f), distance %.2f, min_distance %.2f, ego at (%.2f, %.2f)\n",
+            #     i,
+            #     obstacle.x,
+            #     obstacle.y,
+            #     wp.sqrt(d_sq),
+            #     min_dist,
+            #     px,
+            #     py,
+            # )
             return COLLISION_PENALTY  # Large penalty for collision
 
     return 0.0
@@ -268,35 +278,34 @@ def pcg_hash(input: wp.uint32) -> wp.uint32:
     return (word >> wp.uint32(22)) ^ word
 
 
-@wp.struct
-class RngState:
-    """Wrapper for RNG state to enable pass-by-reference semantics."""
-
-    state: wp.uint32
+@wp.func
+def random_uniform(rng_state: wp.uint32) -> wp.vec2:
+    """Generate uniform random number in [0, 1) and return (value, new_state)."""
+    new_state = pcg_hash(rng_state)
+    value = wp.float32(new_state) / wp.float32(0xFFFFFFFF)
+    return wp.vec2(value, wp.float32(new_state))
 
 
 @wp.func
-def random_uniform(rng: RngState) -> wp.float32:
-    """Generate uniform random number in [0, 1) and advance state."""
-    rng.state = pcg_hash(rng.state)
-    return wp.float32(rng.state) / wp.float32(0xFFFFFFFF)
-
-
-@wp.func
-def random_normal(rng: RngState, mean: wp.float32, std: wp.float32) -> wp.float32:
-    """Generate normal random number using Box-Muller transform and advance state."""
+def random_normal(rng_state: wp.uint32, mean: wp.float32, std: wp.float32) -> wp.vec2:
+    """Generate normal random number using Box-Muller and return (value, new_state)."""
     # Get first uniform sample
-    u1 = random_uniform(rng)
+    u1_result = random_uniform(rng_state)
+    u1 = u1_result[0]
+    state1 = wp.uint32(u1_result[1])
 
     # Get second uniform sample
-    u2 = random_uniform(rng)
+    u2_result = random_uniform(state1)
+    u2 = u2_result[0]
+    final_state = wp.uint32(u2_result[1])
 
     # Ensure u1 > 0 to avoid log(0)
     u1 = wp.max(u1, 1e-8)
 
     # Box-Muller transform
     z0 = wp.sqrt(-2.0 * wp.log(u1)) * wp.cos(2.0 * wp.float32(wp.pi) * u2)
-    return mean + std * z0
+    value = mean + std * z0
+    return wp.vec2(value, wp.float32(final_state))
 
 
 # Main MPPI kernel
@@ -334,16 +343,19 @@ def mppi_rollout_kernel(
         return
 
     # Initialize random state
-    rng = RngState()
-    rng.state = rand_states[sample_idx]
+    rng_state = rand_states[sample_idx]
 
     # Generate control disturbances for this sample
     for ctrl_idx in range(params.num_controls):
         # Generate acceleration noise and update RNG state
-        a_noise = random_normal(rng, 0.0, limits.u_dist_limits[0] / 4.0)
+        a_result = random_normal(rng_state, 0.0, limits.u_dist_limits[0] / 4.0)
+        a_noise = a_result[0]
+        rng_state = wp.uint32(a_result[1])
 
         # Generate steering noise and update RNG state
-        delta_noise = random_normal(rng, 0.0, limits.u_dist_limits[1] / 4.0)
+        delta_result = random_normal(rng_state, 0.0, limits.u_dist_limits[1] / 4.0)
+        delta_noise = delta_result[0]
+        rng_state = wp.uint32(delta_result[1])
 
         # Clamp noise to disturbance limits first
         a_noise = wp.clamp(a_noise, -limits.u_dist_limits[0], limits.u_dist_limits[0])
@@ -359,18 +371,6 @@ def mppi_rollout_kernel(
             u_nominal[ctrl_idx].delta + delta_noise,
             -limits.u_limits[1],
             limits.u_limits[1],
-        )
-
-        wp.printf(
-            "Sample %d, Control %d: a_nom=%.3f, a_dist=%.3f, a_dist_limit=%.3f, delta_nom=%.3f, delta_dist=%.3f, delta_dist_limit=%.3f\n",
-            sample_idx,
-            ctrl_idx,
-            u_nominal[ctrl_idx].a,
-            a_disturbed - u_nominal[ctrl_idx].a,
-            limits.u_dist_limits[0],
-            u_nominal[ctrl_idx].delta,
-            delta_disturbed - u_nominal[ctrl_idx].delta,
-            limits.u_dist_limits[1],
         )
 
         # Store disturbance (difference from nominal)
@@ -518,7 +518,7 @@ def mppi_rollout_kernel(
     costs[sample_idx] = total_cost
 
     # Update random state
-    rand_states[sample_idx] = rng.state
+    rand_states[sample_idx] = rng_state
 
 
 # Weight computation kernels
@@ -693,6 +693,12 @@ class WarpMPPI:
         if debug:
             print(f"[WarpMPPI] Initialized with {samples} samples, method={method}")
 
+    def _pcg_hash(self, input_val: int) -> int:
+        """CPU version of PCG hash for advancing RNG states."""
+        state = (input_val * 747796405 + 2891336453) & 0xFFFFFFFF
+        word = ((state >> ((state >> 28) + 4)) ^ state) * 277803737 & 0xFFFFFFFF
+        return ((word >> 22) ^ word) & 0xFFFFFFFF
+
     def set_steering_limit(self, max_steer_rad: float):
         """Set steering limit."""
         self.limits.u_limits = wp.vec2(self.limits.u_limits[0], max_steer_rad)
@@ -805,6 +811,9 @@ class WarpMPPI:
             ],
             device=self.device,
         )
+
+        # # Ensure GPU kernel completes before continuing
+        # wp.synchronize_device(self.device)
 
         # Find minimum cost
         min_cost_wp = wp.zeros(1, dtype=wp.float32, device=self.device)
