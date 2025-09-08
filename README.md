@@ -10,7 +10,7 @@ For the time being, the visibility-aware portion is undocumented.  Use method='N
 
 ## Core Functionality
 
-### MPPI Controller 
+### MPPI Controller
 
 The MPPI implementation provides:
 
@@ -20,7 +20,7 @@ The MPPI implementation provides:
 - **Vehicle Dynamics**: Bicycle model integration using Runge-Kutta methods
 - **Flexible Cost Weighting**: Configurable weights for state tracking, control effort, and safety costs
 
-A PyCuda-based version is available in the legacy folder.  It has the complete implementation in CUDA, and is kept for reference/posterity. 
+A PyCuda-based version is available in the legacy folder.  It has the complete implementation in CUDA, and is kept for reference/posterity.
 
 ### Key Features
 
@@ -65,7 +65,7 @@ A PyCuda-based version is available in the legacy folder.  It has the complete i
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.10, 3.12
 - NVIDIA GPU with CUDA support
 - warp_lang package  (tested with version 1.9.0)
 
