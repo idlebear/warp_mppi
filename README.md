@@ -144,6 +144,17 @@ Gilhuly, Barry, Armin Sadeghi, and Stephen L. Smith.
 IEEE Robotics and Automation Letters 9.6 (2024): 5583-5590.
 ```
 
+## Original Work
+
+This work is based on the concepts from the [Autonomous Control and Decision Systems Laboratory](https://sites.gatech.edu/acds/mppi/) presented in multiple technical papers.
+
+```
+G. Williams, P. Drews, B. Goldfain, J. M. Rehg and E. A. Theodorou,
+"Aggressive driving with model predictive path integral control,"
+IEEE International Conference on Robotics and Automation (ICRA),
+Stockholm, Sweden, 2016, pp. 1433-1440, doi: 10.1109/ICRA.2016.7487277.
+```
+
 ## License
 
 MIT License.
