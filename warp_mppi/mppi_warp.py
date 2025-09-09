@@ -250,11 +250,8 @@ def our_cost(
 @wp.func
 def wrap_angle(angle: wp.float32) -> wp.float32:
     """Wrap angle to [-pi, pi]."""
-    while angle > wp.pi:
-        angle -= 2.0 * wp.pi
-    while angle < -wp.pi:
-        angle += 2.0 * wp.pi
-    return angle
+    # More efficient than a while loop for large angles
+    return angle - 2.0 * wp.pi * wp.floor((angle + wp.pi) / (2.0 * wp.pi))
 
 
 # Random number generation utilities
@@ -338,12 +335,15 @@ def mppi_rollout_kernel_fast(
     # Generate control disturbances for this sample
     for ctrl_idx in range(params.num_controls):
         # Generate acceleration noise and update RNG state
-        a_result = random_normal(rng_state, 0.0, limits.u_dist_limits[0] / 4.0)
+        # Use a fraction of the disturbance limit as the standard deviation
+        a_std = limits.u_dist_limits[0] / 4.0
+        a_result = random_normal(rng_state, 0.0, a_std)
         a_noise = a_result[0]
         rng_state = wp.uint32(a_result[1])
 
         # Generate steering noise and update RNG state
-        delta_result = random_normal(rng_state, 0.0, limits.u_dist_limits[1] / 4.0)
+        delta_std = limits.u_dist_limits[1] / 4.0
+        delta_result = random_normal(rng_state, 0.0, delta_std)
         delta_noise = delta_result[0]
         rng_state = wp.uint32(delta_result[1])
 
@@ -409,10 +409,7 @@ def mppi_rollout_kernel_fast(
         error_theta = nom_theta - current_theta
 
         # Wrap angle error
-        while error_theta > wp.pi:
-            error_theta -= 2.0 * wp.pi
-        while error_theta < -wp.pi:
-            error_theta += 2.0 * wp.pi
+        error_theta = wrap_angle(error_theta)
 
         state_cost = (
             error_x * weights.Q[0] * error_x
@@ -458,10 +455,7 @@ def mppi_rollout_kernel_fast(
     final_error_theta = x_goal[3] - current_theta
 
     # Wrap final angle error
-    while final_error_theta > wp.pi:
-        final_error_theta -= 2.0 * wp.pi
-    while final_error_theta < -wp.pi:
-        final_error_theta += 2.0 * wp.pi
+    final_error_theta = wrap_angle(final_error_theta)
 
     final_cost = (
         final_error_x * weights.Qf[0] * final_error_x
@@ -489,14 +483,10 @@ def find_min_cost_kernel(
 ):
     """Find minimum cost across all samples."""
     tid = wp.tid()
+    if tid >= len(costs):
+        return
 
-    # Simple reduction for now - can be optimized with shared memory
-    if tid == 0:
-        min_val = costs[0]
-        for i in range(len(costs)):
-            if costs[i] < min_val:
-                min_val = costs[i]
-        min_cost[0] = min_val
+    wp.atomic_min(min_cost, 0, costs[tid])
 
 
 @wp.kernel
@@ -592,7 +582,7 @@ class WarpMPPI:
 
     def __init__(
         self,
-        vehicle=None,  # For compatibility
+        vehicle=None,
         samples: int = 1000,
         seed: int = None,
         u_limits: List[float] = [3.0, 0.5],
@@ -901,7 +891,7 @@ if __name__ == "__main__":
             dt=0.1,
         )
 
-        print(f"✓ Control computed successfully!")
+        print("✓ Control computed successfully!")
         print(f"  Optimal control shape: {u_opt.shape}")
         print(f"  Samples shape: {u_samples.shape}")
         print(f"  Weights shape: {weights.shape}")
