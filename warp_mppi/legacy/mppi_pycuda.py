@@ -606,7 +606,6 @@ class MPPI:
         method,
         c_lambda,
         scan_range,
-        vehicle_length,
         debug=False,
         steering_rate_weight=0.0,
     ):
@@ -642,7 +641,9 @@ class MPPI:
         self.optimization_args["method"] = np.int32(MPPI.visibility_methods[method])
         self.optimization_args["c_lambda"] = np.float32(c_lambda)
         self.optimization_args["scan_range"] = np.float32(scan_range)
-        self.optimization_args["vehicle_length"] = np.float32(vehicle_length)
+        self.optimization_args["vehicle_length"] = (
+            np.float32(vehicle.L) if vehicle else np.float32(1.0)
+        )
         self.optimization_args["steering_rate_weight"] = np.float32(
             steering_rate_weight
         )
