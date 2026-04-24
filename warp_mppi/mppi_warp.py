@@ -43,18 +43,6 @@ class Control:
 
 
 @wp.struct
-class Obstacle:
-    """Circular obstacle representation."""
-
-    x: wp.float32  # Center x
-    y: wp.float32  # Center y
-    radius: wp.float32  # Obstacle radius
-    min_x: wp.float32  # Minimum distance point x
-    min_y: wp.float32  # Minimum distance point y
-    distance: wp.float32  # Distance to vehicle
-
-
-@wp.struct
 class OptimizationParams:
     """MPPI optimization parameters."""
 
@@ -63,7 +51,9 @@ class OptimizationParams:
     dt: wp.float32
     num_controls: wp.int32
     num_obstacles: wp.int32
+    obstacle_steps: wp.int32
     vehicle_length: wp.float32
+    vehicle_width: wp.float32
     c_lambda: wp.float32
     scan_range: wp.float32
     steering_rate_weight: wp.float32
@@ -137,50 +127,167 @@ def runge_kutta_step(
 
 # Cost function implementations
 @wp.func
-def obstacle_cost(
-    obstacles: wp.array(dtype=Obstacle),
-    num_obstacles: wp.int32,
+def _three_circle_collision(
     px: wp.float32,
     py: wp.float32,
+    base_x: wp.float32,
+    base_y: wp.float32,
+    cos_theta: wp.float32,
+    sin_theta: wp.float32,
+    extent_dx: wp.float32,
+    extent_dy: wp.float32,
     vehicle_radius: wp.float32,
-) -> wp.float32:
-    """Compute collision cost with circular obstacles."""
-    for i in range(num_obstacles):
-        obstacle = obstacles[i]
-        dx = obstacle.x - px
-        dy = obstacle.y - py
-        d_sq = dx * dx + dy * dy
-        min_dist = obstacle.radius + vehicle_radius
+) -> wp.int32:
+    radius = extent_dy
+    offset = wp.max(extent_dx - extent_dy, 0.0)
 
-        if d_sq < min_dist * min_dist:
-            return COLLISION_PENALTY  # Large penalty for collision
+    if offset < 1e-6:
+        num_circles = 1
+    else:
+        num_circles = 3
+
+    for circle_idx in range(num_circles):
+        offset_val = wp.float32(0.0)
+        if circle_idx == 1:
+            offset_val = offset
+        elif circle_idx == 2:
+            offset_val = -offset
+
+        cx = base_x + offset_val * cos_theta
+        cy = base_y + offset_val * sin_theta
+
+        dx = cx - px
+        dy = cy - py
+        min_dist = radius + vehicle_radius
+
+        if dx * dx + dy * dy < min_dist * min_dist:
+            return wp.int32(1)
+
+    return wp.int32(0)
+
+
+@wp.func
+def obstacle_cost(
+    obstacle_extents: wp.array(dtype=wp.float32),
+    obstacle_states: wp.array(dtype=wp.float32),
+    num_obstacles: wp.int32,
+    obstacle_steps: wp.int32,
+    step_idx: wp.int32,
+    px: wp.float32,
+    py: wp.float32,
+    ptheta: wp.float32,
+    vehicle_length: wp.float32,
+    vehicle_width: wp.float32,
+) -> wp.float32:
+    """Compute collision cost using three-circle per-obstacle footprint."""
+    if num_obstacles == 0 or obstacle_steps <= 0:
+        return 0.0
+
+    clamped_step = step_idx
+    if clamped_step < 0:
+        clamped_step = 0
+    if clamped_step >= obstacle_steps:
+        clamped_step = obstacle_steps - 1
+
+    # Ego vehicle three-circle model
+    ego_radius = vehicle_width / 2.0
+    ego_offset = wp.max(vehicle_length - vehicle_width, 0.0) / 2.0
+    ego_cos_theta = wp.cos(ptheta)
+    ego_sin_theta = wp.sin(ptheta)
+    ego_circles = 1 if ego_offset <= 0.0 else 3
+
+    for obs in range(num_obstacles):
+        # Obstacle three-circle model
+        obs_extent_dx = obstacle_extents[obs * 2 + 0]
+        obs_extent_dy = obstacle_extents[obs * 2 + 1]
+        obs_radius = obs_extent_dy
+        obs_offset = wp.max(obs_extent_dx - obs_extent_dy, 0.0) / 2.0
+        obs_circles = 1 if obs_offset <= 0.0 else 3
+
+        state_base = (obs * obstacle_steps + clamped_step) * 4
+        obs_x = obstacle_states[state_base + 0]
+        obs_y = obstacle_states[state_base + 1]
+        obs_theta = obstacle_states[state_base + 3]
+
+        obs_cos_theta = wp.cos(obs_theta)
+        obs_sin_theta = wp.sin(obs_theta)
+
+        # 3x3 circle checks
+        for ego_circle_idx in range(ego_circles):
+            ego_dist_along = 0.0
+            if ego_circle_idx == 1:
+                ego_dist_along = ego_offset
+            elif ego_circle_idx == 2:
+                ego_dist_along = -ego_offset
+
+            ego_cx = px + ego_dist_along * ego_cos_theta
+            ego_cy = py + ego_dist_along * ego_sin_theta
+
+            for obs_circle_idx in range(obs_circles):
+                obs_dist_along = 0.0
+                if obs_circle_idx == 1:
+                    obs_dist_along = obs_offset
+                elif obs_circle_idx == 2:
+                    obs_dist_along = -obs_offset
+
+                obs_cx = obs_x + obs_dist_along * obs_cos_theta
+                obs_cy = obs_y + obs_dist_along * obs_sin_theta
+
+                dx = obs_cx - ego_cx
+                dy = obs_cy - ego_cy
+                min_dist_sq = (obs_radius + ego_radius) * (obs_radius + ego_radius)
+
+                if (dx * dx + dy * dy) < min_dist_sq:
+                    return COLLISION_PENALTY
+
+                if obs_offset <= 1e-6:
+                    break  # Obstacle is a single circle
+
+            if ego_offset <= 1e-6:
+                break  # Ego vehicle is a single circle
 
     return 0.0
 
 
 @wp.func
 def higgins_cost(
-    obstacles: wp.array(dtype=Obstacle),
+    obstacle_extents: wp.array(dtype=wp.float32),
+    obstacle_states: wp.array(dtype=wp.float32),
     num_obstacles: wp.int32,
+    obstacle_steps: wp.int32,
     M: wp.float32,
     px: wp.float32,
     py: wp.float32,
+    step_idx: wp.int32,
     scan_range: wp.float32,
 ) -> wp.float32:
-    """Higgins visibility cost function."""
-    cost = float(0.0)  # Dynamic variable for loop mutation
+    """Higgins visibility cost using dynamic obstacle poses."""
+    cost = float(0.0)
+
+    if num_obstacles == 0 or obstacle_steps <= 0:
+        return cost
+
+    clamped_step = step_idx
+    if clamped_step < 0:
+        clamped_step = 0
+    if clamped_step >= obstacle_steps:
+        clamped_step = obstacle_steps - 1
+
     r_fov_sq = scan_range * scan_range
 
-    for i in range(num_obstacles):
-        obstacle = obstacles[i]
-        dx = obstacle.x - px
-        dy = obstacle.y - py
+    for obs in range(num_obstacles):
+        state_base = (obs * obstacle_steps + clamped_step) * 4
+        obs_x = obstacle_states[state_base + 0]
+        obs_y = obstacle_states[state_base + 1]
+
+        dx = obs_x - px
+        dy = obs_y - py
         d_sq = dx * dx + dy * dy
-        d = wp.sqrt(d_sq)
+        d = wp.sqrt(d_sq + 1e-8)
 
-        inner = obstacle.radius / d * (r_fov_sq - d_sq)
+        radius = obstacle_extents[obs * 2 + 1]
+        inner = radius / d * (r_fov_sq - d_sq)
 
-        # Avoid overflow in exponential
         if inner > 60.0:
             score = inner
         else:
@@ -193,30 +300,44 @@ def higgins_cost(
 
 @wp.func
 def andersen_cost(
-    obstacles: wp.array(dtype=Obstacle),
+    obstacle_extents: wp.array(dtype=wp.float32),
+    obstacle_states: wp.array(dtype=wp.float32),
     num_obstacles: wp.int32,
+    obstacle_steps: wp.int32,
     M: wp.float32,
     px: wp.float32,
     py: wp.float32,
+    step_idx: wp.int32,
     vx: wp.float32,
     vy: wp.float32,
 ) -> wp.float32:
-    """Andersen visibility cost function."""
-    cost = float(0.0)  # Dynamic variable for loop mutation
-    v = wp.sqrt(vx * vx + vy * vy)
+    """Andersen visibility reward using dynamic obstacle poses."""
+    cost = float(0.0)
+    speed = wp.sqrt(vx * vx + vy * vy)
 
-    for i in range(num_obstacles):
-        obstacle = obstacles[i]
-        dx = obstacle.x - px
-        dy = obstacle.y - py
+    if num_obstacles == 0 or obstacle_steps <= 0 or speed <= 1e-6:
+        return cost
 
-        # Check if the obstacle is in front of the vehicle
+    clamped_step = step_idx
+    if clamped_step < 0:
+        clamped_step = 0
+    if clamped_step >= obstacle_steps:
+        clamped_step = obstacle_steps - 1
+
+    for obs in range(num_obstacles):
+        state_base = (obs * obstacle_steps + clamped_step) * 3
+        obs_x = obstacle_states[state_base + 0]
+        obs_y = obstacle_states[state_base + 1]
+
+        dx = obs_x - px
+        dy = obs_y - py
+
         dot = dx * vx + dy * vy
         if dot > 0.0:
-            d = wp.sqrt(dx * dx + dy * dy)
-            # Andersen is a reward (negative cost)
-            cost -= M * wp.acos(wp.clamp(dot / (d * v + 1e-8), -1.0, 1.0))
-            break  # Only consider the closest obstacle
+            d = wp.sqrt(dx * dx + dy * dy + 1e-8)
+            ratio = wp.clamp(dot / (d * speed + 1e-8), -1.0, 1.0)
+            cost -= M * wp.acos(ratio)
+            break
 
     return cost
 
@@ -304,7 +425,10 @@ def mppi_rollout_kernel_fast(
     x_nominal_flat: wp.array(dtype=wp.float32),  # [num_states * 4]
     u_nominal_flat: wp.array(dtype=wp.float32),  # [num_controls * 2]
     # Obstacles and costmap
-    obstacles_flat: wp.array(dtype=wp.float32),  # [num_obstacles * 3] (x, y, radius)
+    obstacle_extents_flat: wp.array(dtype=wp.float32),  # [num_obstacles * 2] (dx, dy)
+    obstacle_states_flat: wp.array(  # [num_obstacles * steps * 4] (x, y, v, theta)
+        dtype=wp.float32
+    ),  # [num_obstacles * steps * 3] (x, y, theta)
     costmap: wp.array2d(dtype=wp.float32),
     # Parameters
     params: OptimizationParams,
@@ -425,22 +549,18 @@ def mppi_rollout_kernel_fast(
             dist_a * weights.R[0] * dist_a + dist_delta * weights.R[1] * dist_delta
         )
 
-        # Obstacle cost - simplified
-        vehicle_radius = params.vehicle_length / 2.0
-        obstacle_cost_val = float(0.0)  # Declare as dynamic variable
-        for i in range(params.num_obstacles):
-            obs_x = obstacles_flat[i * 3 + 0]
-            obs_y = obstacles_flat[i * 3 + 1]
-            obs_radius = obstacles_flat[i * 3 + 2]
-
-            dx = obs_x - current_x
-            dy = obs_y - current_y
-            d_sq = dx * dx + dy * dy
-            min_dist = obs_radius + vehicle_radius
-
-            if d_sq < min_dist * min_dist:
-                obstacle_cost_val = COLLISION_PENALTY
-                break
+        obstacle_cost_val = obstacle_cost(
+            obstacle_extents_flat,
+            obstacle_states_flat,
+            params.num_obstacles,
+            params.obstacle_steps,
+            step,
+            current_x,
+            current_y,
+            current_theta,
+            params.vehicle_length,
+            params.vehicle_width,
+        )
 
         total_cost += state_cost + control_cost + obstacle_cost_val
 
@@ -582,7 +702,8 @@ class WarpMPPI:
 
     def __init__(
         self,
-        vehicle=None,
+        vehicle_length: float,
+        vehicle_width: float,
         samples: int = 1000,
         seed: int = None,
         u_limits: List[float] = [3.0, 0.5],
@@ -607,10 +728,13 @@ class WarpMPPI:
         self.params = OptimizationParams()
         self.params.samples = samples
         self.params.M = M
-        self.params.vehicle_length = vehicle.L if vehicle else 1.0
+        self.params.vehicle_length = vehicle_length
+        self.params.vehicle_width = vehicle_width
         self.params.c_lambda = c_lambda
         self.params.scan_range = scan_range
         self.params.steering_rate_weight = steering_rate_weight
+        self.params.num_obstacles = 0
+        self.params.obstacle_steps = 0
 
         if method not in self.visibility_methods:
             raise ValueError(f"Unknown method: {method}")
@@ -664,8 +788,8 @@ class WarpMPPI:
         x_goal: List[float],
         x_nom: np.ndarray,
         u_nom: np.ndarray,
-        actors: List[List[float]],
         dt: float,
+        obstacles=None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Find optimal control using Warp-accelerated MPPI.
@@ -678,8 +802,10 @@ class WarpMPPI:
             x_goal: Goal state [x, y, v, theta]
             x_nom: Nominal state trajectory
             u_nom: Nominal control sequence
-            actors: List of obstacles [[x, y, radius], ...]
             dt: Time step
+            obstacles: Iterable of obstacle definitions. Each obstacle should be a dict
+                with keys ``states`` (shape ``(T, 3)`` for ``x, y, theta``) and
+                ``extent`` (``dx, dy``), or a tuple ``(states, extent)``.
 
         Returns:
             Tuple of (optimal_controls, control_samples, weights)
@@ -688,7 +814,6 @@ class WarpMPPI:
         # Update parameters for this solve
         self.params.dt = dt
         self.params.num_controls = len(u_nom)
-        self.params.num_obstacles = len(actors)
 
         # Convert inputs to Warp arrays
         costmap_wp = wp.array(
@@ -703,13 +828,83 @@ class WarpMPPI:
         u_nom_flat = u_nom.astype(np.float32).flatten()
         u_nominal_wp = wp.array(u_nom_flat, dtype=wp.float32, device=self.device)
 
-        # Convert obstacles to flattened format
-        obstacles_flat = np.zeros(len(actors) * 3, dtype=np.float32)
-        for i, actor in enumerate(actors):
-            obstacles_flat[i * 3 + 0] = actor[0]  # x
-            obstacles_flat[i * 3 + 1] = actor[1]  # y
-            obstacles_flat[i * 3 + 2] = actor[2]  # radius
-        obstacles_wp = wp.array(obstacles_flat, dtype=wp.float32, device=self.device)
+        if obstacles is None:
+            obstacles = []
+
+        num_obstacles = len(obstacles)
+        self.params.num_obstacles = num_obstacles
+
+        if num_obstacles > 0:
+            obstacle_sequences = []
+            obstacle_extents = []
+            max_steps = 0
+
+            for obs in obstacles:
+                if isinstance(obs, dict):
+                    states = obs.get("states")
+                    extent = obs.get("extent")
+                else:
+                    try:
+                        states, extent = obs
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            "Each obstacle must be a dict with 'states'/'extent' or a (states, extent) tuple"
+                        ) from None
+
+                if states is None or extent is None:
+                    raise ValueError(
+                        "Obstacle definitions require both state trajectories and extents"
+                    )
+
+                states_arr = np.asarray(states, dtype=np.float32)
+                if states_arr.ndim != 2 or states_arr.shape[1] != 4:
+                    raise ValueError(
+                        "Obstacle states must have shape (T, 4) containing (x, y, v, theta)"
+                    )
+                if states_arr.shape[0] == 0:
+                    raise ValueError(
+                        "Obstacle state trajectories must contain at least one timestep"
+                    )
+
+                extent_arr = np.asarray(extent, dtype=np.float32)
+                if extent_arr.shape != (2,):
+                    raise ValueError(
+                        "Obstacle extents must be length-2 iterable (dx, dy)"
+                    )
+
+                obstacle_sequences.append(states_arr)
+                obstacle_extents.append(extent_arr)
+                if states_arr.shape[0] > max_steps:
+                    max_steps = states_arr.shape[0]
+
+            obstacle_steps = int(max_steps)
+
+            padded_states = np.zeros(  # x, y, v, theta
+                (num_obstacles, obstacle_steps, 4), dtype=np.float32
+            )
+            for idx, states_arr in enumerate(obstacle_sequences):
+                steps = states_arr.shape[0]
+                padded_states[idx, :steps, :] = states_arr
+                if steps < obstacle_steps:
+                    padded_states[idx, steps:, :] = states_arr[-1]
+
+            obstacle_states_flat = padded_states.flatten()
+            obstacle_extents_arr = np.array(obstacle_extents, dtype=np.float32).reshape(
+                num_obstacles, 2
+            )
+        else:
+            obstacle_steps = 0
+            obstacle_states_flat = np.zeros(0, dtype=np.float32)
+            obstacle_extents_arr = np.zeros((0, 2), dtype=np.float32)
+
+        self.params.obstacle_steps = obstacle_steps
+
+        obstacle_extents_wp = wp.array(
+            obstacle_extents_arr.flatten(), dtype=wp.float32, device=self.device
+        )
+        obstacle_states_wp = wp.array(
+            obstacle_states_flat, dtype=wp.float32, device=self.device
+        )
 
         # Allocate output arrays - use flattened format
         u_disturbances_wp = wp.zeros(
@@ -725,7 +920,8 @@ class WarpMPPI:
                 self.rand_states,
                 x_nominal_wp,
                 u_nominal_wp,
-                obstacles_wp,
+                obstacle_extents_wp,
+                obstacle_states_wp,
                 costmap_wp,
                 self.params,
                 self.weights,
@@ -859,7 +1055,8 @@ if __name__ == "__main__":
     # Create a simple controller
     controller = WarpMPPI(
         samples=100,  # Smaller for testing
-        vehicle_length=2.5,
+        vehicle_length=4.5,
+        vehicle_width=2.0,
         u_limits=[3.0, 0.5],
         u_dist_limits=[0.5, 0.1],
         Q=[1.0, 1.0, 0.1, 0.1],
@@ -876,7 +1073,10 @@ if __name__ == "__main__":
     x_goal = [10.0, 0.0, 1.0, 0.0]
     x_nom = np.array([[i, 0.0, 1.0, 0.0] for i in range(11)])
     u_nom = np.array([[0.0, 0.0] for _ in range(10)])
-    actors = [[5.0, 2.0, 1.0]]
+    obstacle_states = np.array(
+        [[5.0, 2.0, 0.0, 0.0] for _ in range(u_nom.shape[0])], dtype=np.float32
+    )
+    obstacles = [{"states": obstacle_states, "extent": [2.5, 1.2]}]
 
     try:
         u_opt, u_samples, weights = controller.find_control(
@@ -887,7 +1087,7 @@ if __name__ == "__main__":
             x_goal=x_goal,
             x_nom=x_nom,
             u_nom=u_nom,
-            actors=actors,
+            obstacles=obstacles,
             dt=0.1,
         )
 

@@ -1,14 +1,111 @@
-import sys
-from typing import Any
+import atexit  # For ensuring context cleanup on exit
+import contextlib
+import functools
 import numpy as np
 
+import pycuda.gpuarray as gpuarray
 import pycuda.driver as cuda
-import pycuda.autoinit as _pycuda_autoinit  # ensures a context exists
+
+# import pycuda.autoinit  # Removed to allow flexible context management
 from pycuda.compiler import SourceModule
 from pycuda import characterize
 
+import sys
+from typing import Any
+
 
 _cuda: Any = cuda  # alias to satisfy static analyzers
+
+# --- CUDA Context Management ---
+_MODULE_CONTEXT = None  # Stores the context active during SourceModule compilation
+_owns_module_context_ref = False  # True if this module must detach _MODULE_CONTEXT
+_module_context_pushed = False  # True while this module has _MODULE_CONTEXT on the stack
+
+
+def _establish_module_context():
+    """
+    Ensures a CUDA context is available for SourceModule compilation and sets
+    _MODULE_CONTEXT. Called once when the module is loaded.
+
+    Retains the primary context on the current device, or device 0 if no
+    context is current, and pushes it only long enough to compile the kernels.
+    """
+    global _MODULE_CONTEXT, _owns_module_context_ref, _module_context_pushed
+    # This function should only effectively run once at module import.
+    if _MODULE_CONTEXT is not None:
+        return
+
+    cuda.init()  # Ensure CUDA driver is initialized before querying contexts
+
+    # A current context handle is not retained ownership. Use it only to choose
+    # the device, then retain our own primary-context reference on that device.
+    device = None
+    try:
+        current_context = cuda.Context.get_current()
+        if current_context is not None:
+            device = cuda.Context.get_device()
+    except cuda.LogicError:
+        pass
+
+    if device is None:
+        device = cuda.Device(0)  # Default to device 0
+    try:
+        _MODULE_CONTEXT = device.retain_primary_context()
+        _MODULE_CONTEXT.push()
+        _owns_module_context_ref = True
+    except AttributeError:
+        # Older PyCUDA fallback. make_context() creates and pushes a user context.
+        _MODULE_CONTEXT = device.make_context()
+        _owns_module_context_ref = True
+
+    _module_context_pushed = True
+
+
+def _pop_module_context_after_compile():
+    """Undo the temporary import-time push performed for kernel compilation."""
+    global _module_context_pushed
+    if _module_context_pushed and _MODULE_CONTEXT is not None:
+        _MODULE_CONTEXT.pop()
+        _module_context_pushed = False
+
+
+@contextlib.contextmanager
+def _active_cuda_context(context):
+    """Temporarily make a retained MPPI context current on this thread."""
+    context.push()
+    try:
+        yield
+    finally:
+        context.pop()
+
+
+def _cleanup_context_atexit():
+    """
+    Registered with atexit. Releases the CUDA context reference owned by this
+    module, if this module retained or created one at import time.
+    """
+    global _MODULE_CONTEXT, _owns_module_context_ref, _module_context_pushed
+    if _owns_module_context_ref and _MODULE_CONTEXT is not None:
+        try:
+            if _module_context_pushed:
+                _MODULE_CONTEXT.pop()
+                _module_context_pushed = False
+
+            _MODULE_CONTEXT.detach()  # Release/destroy the retained context
+
+            _MODULE_CONTEXT = None
+            _owns_module_context_ref = False
+        except cuda.Error:
+            # Suppress errors during atexit cleanup (e.g., if context was already destroyed)
+            pass
+        except Exception:
+            # Suppress any other unexpected errors during atexit cleanup
+            pass
+
+
+atexit.register(_cleanup_context_atexit)
+# --- End CUDA Context Management ---
+
 
 BLOCK_SIZE = 32
 
@@ -48,6 +145,7 @@ _MPPI_CUDA_SOURCE = """
         float dt;
         int num_controls;
         int num_obstacles;
+        int obstacle_steps;
         float x_init[4];
         float x_goal[4];
         float u_limits[2];
@@ -59,20 +157,13 @@ _MPPI_CUDA_SOURCE = """
         float c_lambda;
         float scan_range;
         float vehicle_length;
+        float vehicle_width;
     float steering_rate_weight; // added optional penalty weight
     };
 
-    struct Object {
-        float x;
-        float y;
-        float radius;
-    };
-
     struct Obstacle {
-        Object loc;
-        float min_x;
-        float min_y;
-        float distance;
+        float dx;
+        float dy;
     };
 
     struct State {
@@ -96,6 +187,35 @@ _MPPI_CUDA_SOURCE = """
         float a;
         float delta;
     };
+
+    __device__
+    inline float clamp_unit(float value) {
+        const float eps = 1e-5f;
+        if (value > 1.0f - eps) {
+            return 1.0f - eps;
+        }
+        if (value < -1.0f + eps) {
+            return -1.0f + eps;
+        }
+        return value;
+    }
+
+    __device__
+    inline float unsquash_control(float value, float limit) {
+        if (limit <= FLT_EPSILON) {
+            return 0.0f;
+        }
+        float unit_value = clamp_unit(value / limit);
+        return 0.5f * logf((1.0f + unit_value) / (1.0f - unit_value));
+    }
+
+    __device__
+    inline float squash_control(float z_value, float limit) {
+        if (limit <= FLT_EPSILON) {
+            return 0.0f;
+        }
+        return limit * tanhf(z_value);
+    }
 
     //
     // Based on a comment from the following link on checking for zero:
@@ -125,47 +245,121 @@ _MPPI_CUDA_SOURCE = """
     }
 
     __device__
-    float obstacle_cost(const Obstacle *obstacles, int num_obstacles, float px, float py, float radius) {
-      for (int i = 0; i < num_obstacles; i++) {
-        auto obstacle = &obstacles[i];
-        float dx = obstacle->loc.x - px;
-        float dy = obstacle->loc.y - py;
-        float d_2 = dx * dx + dy * dy;
-        float min_dist = obstacle->loc.radius + radius;
+    float obstacle_cost(
+        const Obstacle *obstacles,
+        const State *obstacle_states,
+        int num_obstacles,
+        int obstacle_steps,
+        int step_idx, // current timestep index
+        float px, float py, float p_theta, // ego vehicle pose
+        float vehicle_length, float vehicle_width // ego vehicle dimensions
+    ) {
+      if (num_obstacles == 0 || obstacle_steps <= 0) {
+        return 0.0f;
+      }
 
-        if (d_2 < min_dist * min_dist) {
-          return 10000000.0;
+      int clamped_step = step_idx;
+      if (clamped_step < 0) {
+        clamped_step = 0;
+      }
+      if (clamped_step >= obstacle_steps) {
+        clamped_step = obstacle_steps - 1;
+      }
+
+      // Ego vehicle three-circle model
+      float ego_radius = vehicle_width / 2.0f;
+      float ego_offset = fmaxf(vehicle_length - vehicle_width, 0.0f) / 2.0f;
+      float ego_cos_theta = cosf(p_theta);
+      float ego_sin_theta = sinf(p_theta);
+      const int ego_circles = (ego_offset <= 0.0f) ? 1 : 3;
+
+      for (int i = 0; i < num_obstacles; i++) {
+        const State obstacle_state = obstacle_states[i * obstacle_steps + clamped_step];
+        const float obs_extent_x = obstacles[i].dx;
+        const float obs_extent_y = obstacles[i].dy;
+        const float obs_radius = obs_extent_y;
+        const float obs_offset = fmaxf(obs_extent_x - obs_extent_y, 0.0f) / 2.0f;
+
+        const float obs_cos_theta = cosf(obstacle_state.theta);
+        const float obs_sin_theta = sinf(obstacle_state.theta);
+        const int obs_circles = (ego_offset <= 0.0f) ? 1 : 3;
+
+        // 3x3 circle checks
+        for (int ego_circle_idx = 0; ego_circle_idx < ego_circles; ++ego_circle_idx) {
+          float ego_dist_along = 0.0f;
+          if (ego_circle_idx == 1) ego_dist_along = ego_offset;
+          else if (ego_circle_idx == 2) ego_dist_along = -ego_offset;
+
+          const float ego_cx = px + ego_dist_along * ego_cos_theta;
+          const float ego_cy = py + ego_dist_along * ego_sin_theta;
+
+          for (int obs_circle_idx = 0; obs_circle_idx < obs_circles; ++obs_circle_idx) {
+            float obs_dist_along = 0.0f;
+            if (obs_circle_idx == 1) obs_dist_along = obs_offset;
+            else if (obs_circle_idx == 2) obs_dist_along = -obs_offset;
+
+            const float obs_cx = obstacle_state.x + obs_dist_along * obs_cos_theta;
+            const float obs_cy = obstacle_state.y + obs_dist_along * obs_sin_theta;
+
+            const float dx = obs_cx - ego_cx;
+            const float dy = obs_cy - ego_cy;
+            const float min_dist = obs_radius + ego_radius;
+
+            if ((dx * dx + dy * dy) < (min_dist * min_dist)) {
+              return 10000000.0f;
+            }
+          }
         }
       }
-      return 0.0;
+
+      return 0.0f;
     }
 
 
     __device__
-    float higgins_cost(const float M, const Obstacle *obstacles, int num_obstacles, float px, float py, float scan_range) {
+    float higgins_cost(
+        const float M,
+        const Obstacle *obstacles,
+        const State *obstacle_states,
+        int num_obstacles,
+        int obstacle_steps,
+        int step_idx,
+        float px,
+        float py,
+        float scan_range
+    ) {
 
-      float cost = 0.0;
+      float cost = 0.0f;
 
-      float r_fov = scan_range;
-      float r_fov_2 = r_fov*r_fov;
+      if (num_obstacles == 0 || obstacle_steps <= 0) {
+        return cost;
+      }
 
-      // ( "Checking higgins! px: %f, py: %f, scan_range: %f\\n", px, py, scan_range);
+      int clamped_step = step_idx;
+      if (clamped_step < 0) {
+        clamped_step = 0;
+      }
+      if (clamped_step >= obstacle_steps) {
+        clamped_step = obstacle_steps - 1;
+      }
+
+      const float r_fov = scan_range;
+      const float r_fov_2 = r_fov * r_fov;
 
       for (int i = 0; i < num_obstacles; i++) {
-        auto obstacle = &obstacles[i];
-        float dx = obstacle->loc.x - px;
-        float dy = obstacle->loc.y - py;
-        float d_2 = dx * dx + dy * dy;
-        float d = sqrtf(d_2);
+        const State obstacle_state = obstacle_states[i * obstacle_steps + clamped_step];
+        const float dx = obstacle_state.x - px;
+        const float dy = obstacle_state.y - py;
+        const float d_2 = dx * dx + dy * dy;
+        const float d = sqrtf(d_2);
 
-        float inner = obstacle->loc.radius / d * (r_fov_2 - d_2);
-        auto inner_exp = expf(inner);
+        const float radius = obstacles[i].dy;
+        float inner = 0.0f;
+        if (d > FLT_EPSILON) {
+          inner = radius / d * (r_fov_2 - d_2);
+        }
+        const float inner_exp = expf(inner);
         float score;
-
-        // printf( "obstacle->loc.x: %f, obstacle->loc.y: %f, obstacle->loc.radius: %f\\n", obstacle->loc.x, obstacle->loc.y, obstacle->loc.radius );
-        // printf( "px: %f, py: %f, scan_range: %f\\n", px, py, scan_range );
-        // printf( "d_2: %f, d: %f\\n", d_2, d );
-        // printf( "inner: %f, inner_exp: %f\\n", inner, inner_exp );
 
         if( isinf(inner_exp) || isnan(inner_exp) ) {
           score = inner;
@@ -180,22 +374,45 @@ _MPPI_CUDA_SOURCE = """
 
     __device__
     float
-    andersen_cost( const float M, const Obstacle *obstacles, int num_obstacles, float px, float py, float vx, float vy) {
-      float cost = 0.0;
+    andersen_cost(
+        const float M,
+        const Obstacle *obstacles,
+        const State *obstacle_states,
+        int num_obstacles,
+        int obstacle_steps,
+        int step_idx,
+        float px,
+        float py,
+        float vx,
+        float vy
+    ) {
+      float cost = 0.0f;
       float v = sqrtf(vx * vx + vy * vy);
 
-      for (int i = 0; i < num_obstacles; i++) {
-        auto obstacle = &obstacles[i];
-        float dx = obstacle->min_x - px;
-        float dy = obstacle->min_y - py;
+      if (num_obstacles == 0 || obstacle_steps <= 0 || v <= FLT_EPSILON) {
+        return cost;
+      }
 
-        // check if the obstacle is in front of the vehicle
+      int clamped_step = step_idx;
+      if (clamped_step < 0) {
+        clamped_step = 0;
+      }
+      if (clamped_step >= obstacle_steps) {
+        clamped_step = obstacle_steps - 1;
+      }
+
+      for (int i = 0; i < num_obstacles; i++) {
+        const State obstacle_state = obstacle_states[i * obstacle_steps + clamped_step];
+        float dx = obstacle_state.x - px;
+        float dy = obstacle_state.y - py;
+
         auto dot = dx * vx + dy * vy;
-        if (dot > 0) {
+        if (dot > 0.0f) {
           float d = sqrtf(dx * dx + dy * dy);
-          // Andersen is a reward
-          cost -= M * acosf(dot / (d * v));
-          break;   // only consider the closest obstacle
+          if (d > FLT_EPSILON) {
+            cost -= M * acosf(fminf(fmaxf(dot / (d * v), -1.0f), 1.0f));
+          }
+          break;
         }
       }
 
@@ -281,16 +498,16 @@ _MPPI_CUDA_SOURCE = """
     ) {
       curandState localState = globalState[index];
             for (int i = 0; i < num_controls; i++) {
-                // Gaussian (normal) noise, std dev = u_dist_limits[*]
-                float a_noise = curand_normal(&localState) * u_dist_limits[0];
-                float delta_noise = curand_normal(&localState) * u_dist_limits[1];
-                float a_candidate = u_nom[i].a + a_noise;
-                float delta_candidate = u_nom[i].delta + delta_noise;
-                // Clamp to limits
-                if (a_candidate >  u_limits[0]) a_candidate =  u_limits[0];
-                if (a_candidate < -u_limits[0]) a_candidate = -u_limits[0];
-                if (delta_candidate >  u_limits[1]) delta_candidate =  u_limits[1];
-                if (delta_candidate < -u_limits[1]) delta_candidate = -u_limits[1];
+                // Sample in unconstrained squashed-control coordinates:
+                //   u = limit * tanh(z)
+                // This avoids the boundary bias caused by clipping sampled controls
+                // and then averaging the clipped disturbances in control space.
+                float a_z_nom = unsquash_control(u_nom[i].a, u_limits[0]);
+                float delta_z_nom = unsquash_control(u_nom[i].delta, u_limits[1]);
+                float a_z_noise = curand_normal(&localState) * (u_dist_limits[0] / fmaxf(u_limits[0], FLT_EPSILON));
+                float delta_z_noise = curand_normal(&localState) * (u_dist_limits[1] / fmaxf(u_limits[1], FLT_EPSILON));
+                float a_candidate = squash_control(a_z_nom + a_z_noise, u_limits[0]);
+                float delta_candidate = squash_control(delta_z_nom + delta_z_noise, u_limits[1]);
                 // Store disturbance (difference from nominal)
                 u_dist[i].a = a_candidate - u_nom[i].a;
                 u_dist[i].delta = delta_candidate - u_nom[i].delta;
@@ -315,7 +532,8 @@ _MPPI_CUDA_SOURCE = """
             const Costmap_Params *costmap_args,
             const State *x_nom,   // nominal states, num_controls + 1 x state_size
             const Control *u_nom,   // nominal controls, num_controls x control_size
-            const Obstacle *obstacle_data,
+            const Obstacle *obstacles,
+            const State *obstacle_states,
             const Optimization_Params *optimization_args,
             Control *u_dists,
             float *u_weights
@@ -327,6 +545,7 @@ _MPPI_CUDA_SOURCE = """
 
             int num_controls = optimization_args->num_controls;
             int num_obstacles = optimization_args->num_obstacles;
+            int obstacle_steps = optimization_args->obstacle_steps;
             // float M = optimization_args->M;
             float dt = optimization_args->dt;
             const float *u_limits = optimization_args->u_limits;
@@ -395,7 +614,18 @@ _MPPI_CUDA_SOURCE = """
                 }
 
                 // penalize obstacles
-                obstacle_err = obstacle_cost(obstacle_data, num_obstacles, current_state.x, current_state.y, optimization_args->vehicle_length / 2.0);
+                obstacle_err = obstacle_cost(
+                    obstacles,
+                    obstacle_states,
+                    num_obstacles,
+                    obstacle_steps,
+                    i - 1,
+                    current_state.x,
+                    current_state.y,
+                    current_state.theta,
+                    optimization_args->vehicle_length,
+                    optimization_args->vehicle_width
+                );
 
                 // penalize visibility
                 visibility_err = 0;
@@ -405,11 +635,31 @@ _MPPI_CUDA_SOURCE = """
                     // The 'costmap' related parameters (height, width, origin_x, etc.) are in costmap_args.
                     visibility_err = our_cost(optimization_args->M, costmap, costmap_args->height, costmap_args->width, costmap_args->origin_x, costmap_args->origin_y, costmap_args->resolution, current_state.x, current_state.y, i);
                 } else if (method == HIGGINS) {
-                    visibility_err = higgins_cost(optimization_args->M, obstacle_data, num_obstacles, current_state.x, current_state.y, optimization_args->scan_range);
+                    visibility_err = higgins_cost(
+                        optimization_args->M,
+                        obstacles,
+                        obstacle_states,
+                        num_obstacles,
+                        obstacle_steps,
+                        i - 1,
+                        current_state.x,
+                        current_state.y,
+                        optimization_args->scan_range
+                    );
                 } else if (method == ANDERSEN) {
                     // Velocity for Andersen cost is based on nominal trajectory difference
-                    visibility_err = andersen_cost(optimization_args->M, obstacle_data, num_obstacles, current_state.x, current_state.y,
-                                                   (x_nom[i].x - x_nom[i-1].x), (x_nom[i].y - x_nom[i-1].y));
+                    visibility_err = andersen_cost(
+                        optimization_args->M,
+                        obstacles,
+                        obstacle_states,
+                        num_obstacles,
+                        obstacle_steps,
+                        i - 1,
+                        current_state.x,
+                        current_state.y,
+                        (x_nom[i].x - x_nom[i-1].x),
+                        (x_nom[i].y - x_nom[i-1].y)
+                    );
                 }
                 // NO_VISIBILITY and INFO_GAIN_LIKE (if it implies using 'our_cost' already handled by OURS) might not need explicit handling here if OURS covers INFO_GAIN_LIKE
 
@@ -504,10 +754,12 @@ _MPPI_CUDA_SOURCE = """
             int num_controls,
             const float *u_weights,
             const float *u_weight_total,
+            const Optimization_Params *optimization_args,
             Control *u_mppi
     ) {
       int sample_idx = blockIdx.x * blockDim.x + threadIdx.x; // Iterate over samples
       float u_weight_total_float = *u_weight_total; // Dereference
+      const float *u_limits = optimization_args->u_limits;
 
       if (sample_idx < samples) {
         float weight_normalized;
@@ -519,22 +771,34 @@ _MPPI_CUDA_SOURCE = """
 
         for (int ctrl_idx = 0; ctrl_idx < num_controls; ++ctrl_idx) {
             int dist_flat_idx = sample_idx * num_controls + ctrl_idx;
-            // Atomically add weighted disturbances to the nominal control
-            // This needs to be done carefully if u_mppi is shared output for all controls
-            // The current u_mppi is an array of Controls, one per timestep.
-            // We add the weighted disturbance for *this sample* to *each* u_mppi[ctrl_idx]
-            atomicAdd(&(u_mppi[ctrl_idx].a), u_dist[dist_flat_idx].a * weight_normalized);
-            atomicAdd(&(u_mppi[ctrl_idx].delta), u_dist[dist_flat_idx].delta * weight_normalized);
+            float a_nom = u_nom[ctrl_idx].a;
+            float delta_nom = u_nom[ctrl_idx].delta;
+            float a_candidate = a_nom + u_dist[dist_flat_idx].a;
+            float delta_candidate = delta_nom + u_dist[dist_flat_idx].delta;
+
+            float a_nom_z = unsquash_control(a_nom, u_limits[0]);
+            float delta_nom_z = unsquash_control(delta_nom, u_limits[1]);
+            float a_candidate_z = unsquash_control(a_candidate, u_limits[0]);
+            float delta_candidate_z = unsquash_control(delta_candidate, u_limits[1]);
+
+            // u_mppi was initialized with nominal z-space controls. Accumulate
+            // the weighted z-space update; the host maps it back to bounded
+            // controls after this kernel completes.
+            atomicAdd(&(u_mppi[ctrl_idx].a), (a_candidate_z - a_nom_z) * weight_normalized);
+            atomicAdd(&(u_mppi[ctrl_idx].delta), (delta_candidate_z - delta_nom_z) * weight_normalized);
         }
       }
     }
 """
 
 try:
-    _COMPILED_MPPI_MODULE = SourceModule(_MPPI_CUDA_SOURCE, no_extern_c=True)
-    MPPI_MODULE_CONTEXT = getattr(_pycuda_autoinit, "context", None)
-    if MPPI_MODULE_CONTEXT is None:
-        raise RuntimeError("Autoinit did not supply a CUDA context")
+    _establish_module_context()  # Ensure context is ready for SourceModule compilation
+    try:
+        _COMPILED_MODULE = SourceModule(_MPPI_CUDA_SOURCE, no_extern_c=True)
+    finally:
+        _pop_module_context_after_compile()
+    if _MODULE_CONTEXT is None:
+        raise RuntimeError("Failed to create a CUDA context")
 except cuda.CompileError as e:
     print("CUDA Compilation Error:", file=sys.stderr)
     print(e.stderr, file=sys.stderr)
@@ -545,6 +809,7 @@ except Exception as e:
 
 
 class MPPI:
+
     visibility_methods = {
         "Ours": 0,  # CUDA: OURS (can be used for information gain if costmap is such)
         "Ours-Wide": 0,  # Alias for Ours (wider roads in planning)
@@ -567,6 +832,7 @@ class MPPI:
             ("dt", np.float32),
             ("num_controls", np.int32),
             ("num_obstacles", np.int32),
+            ("obstacle_steps", np.int32),
             ("x_init", np.float32, 4),
             ("x_goal", np.float32, 4),
             ("u_limits", np.float32, 2),
@@ -578,6 +844,7 @@ class MPPI:
             ("c_lambda", np.float32),
             ("scan_range", np.float32),
             ("vehicle_length", np.float32),
+            ("vehicle_width", np.float32),
             ("steering_rate_weight", np.float32),
         ]
     )
@@ -594,8 +861,9 @@ class MPPI:
 
     def __init__(
         self,
-        vehicle,
-        samples,
+        vehicle_length: float,
+        vehicle_width: float,
+        samples: int,
         seed,
         u_limits,
         u_dist_limits,
@@ -614,11 +882,10 @@ class MPPI:
         Parameters mirror optimization / cost settings. Gaussian noise sampling
         is used for disturbances with std dev = u_dist_limits (clamped to u_limits).
         """
-        if MPPI_MODULE_CONTEXT is None:
+        if _MODULE_CONTEXT is None:
             raise RuntimeError("CUDA context unavailable for MPPI initialization")
 
-        self.mppi_context = MPPI_MODULE_CONTEXT
-        self.vehicle = vehicle
+        self.mppi_context = _MODULE_CONTEXT
         self.samples = np.int32(samples)
         self.debug = debug
 
@@ -641,17 +908,14 @@ class MPPI:
         self.optimization_args["method"] = np.int32(MPPI.visibility_methods[method])
         self.optimization_args["c_lambda"] = np.float32(c_lambda)
         self.optimization_args["scan_range"] = np.float32(scan_range)
-        self.optimization_args["vehicle_length"] = (
-            np.float32(vehicle.L) if vehicle else np.float32(1.0)
-        )
+        self.optimization_args["vehicle_length"] = np.float32(vehicle_length)
+        self.optimization_args["vehicle_width"] = np.float32(vehicle_width)
         self.optimization_args["steering_rate_weight"] = np.float32(
             steering_rate_weight
         )
 
         # Allocate GPU buffers inside context
-        try:
-            self.mppi_context.push()
-
+        with _active_cuda_context(self.mppi_context):
             self.optimization_args_gpu = _cuda.mem_alloc(self.optimization_args.nbytes)  # type: ignore[attr-defined]
             _cuda.memcpy_htod(self.optimization_args_gpu, self.optimization_args)  # type: ignore[attr-defined]
 
@@ -668,7 +932,7 @@ class MPPI:
             self.globalState_gpu = _cuda.mem_alloc(  # type: ignore[attr-defined]
                 block_cfg[0] * grid_cfg[0] * curand_state_size
             )
-            setup_kernel_func = _COMPILED_MPPI_MODULE.get_function("setup_kernel")
+            setup_kernel_func = _COMPILED_MODULE.get_function("setup_kernel")
             setup_kernel_func(
                 self.globalState_gpu,
                 np.uint32(
@@ -677,11 +941,6 @@ class MPPI:
                 block=block_cfg,
                 grid=grid_cfg,
             )
-        finally:
-            try:
-                self.mppi_context.pop()
-            except Exception:
-                pass
 
         # Diagnostics placeholders
         self.last_ess = None
@@ -697,7 +956,8 @@ class MPPI:
 
     def set_steering_limit(self, max_steer_rad: float):
         self.optimization_args["u_limits"][0, 1] = np.float32(max_steer_rad)
-        _cuda.memcpy_htod(self.optimization_args_gpu, self.optimization_args)  # type: ignore[attr-defined]
+        with _active_cuda_context(self.mppi_context):
+            _cuda.memcpy_htod(self.optimization_args_gpu, self.optimization_args)  # type: ignore[attr-defined]
         if self.debug:
             print(
                 f"[MPPI] Steering limit set to {max_steer_rad:.3f} rad ({np.degrees(max_steer_rad):.1f} deg)"
@@ -713,10 +973,13 @@ class MPPI:
                 print(f"[MPPI] Steering limit sync failed: {e}")
 
     def find_control(
-        self, costmap, origin, resolution, x_init, x_goal, x_nom, u_nom, actors, dt
+        self, costmap, origin, resolution, x_init, x_goal, x_nom, u_nom, obstacles, dt
     ):
         if self.mppi_context is None:
             raise RuntimeError("MPPI has no CUDA context")
+
+        if obstacles is None:
+            obstacles = []
 
         # Host-side outputs
         u_mppi_host = np.zeros_like(u_nom, dtype=np.float32)
@@ -726,7 +989,8 @@ class MPPI:
         u_weights_host = np.zeros(self.samples, dtype=np.float32)
 
         costmap_gpu = None
-        actors_gpu = np.intp(0)
+        obstacles_gpu = np.intp(0)
+        obstacle_states_gpu = np.intp(0)
         u_nom_gpu = None
         x_nom_gpu = None
         u_mppi_gpu = None
@@ -735,8 +999,7 @@ class MPPI:
         u_weight_min_gpu = None
         u_weight_total_gpu = None
 
-        try:
-            self.mppi_context.push()
+        with _active_cuda_context(self.mppi_context):
             try:
                 # Prepare costmap
                 costmap_host = costmap.astype(np.float32)
@@ -750,12 +1013,71 @@ class MPPI:
                 self.costmap_args["resolution"] = resolution
                 _cuda.memcpy_htod(self.costmap_args_gpu, self.costmap_args)  # type: ignore[attr-defined]
 
-                # Obstacles / actors
-                num_actors = np.int32(len(actors))
-                if num_actors > 0:
-                    actors_host = np.array(actors, dtype=np.float32)
-                    actors_gpu = _cuda.mem_alloc(actors_host.nbytes)  # type: ignore[attr-defined]
-                    _cuda.memcpy_htod(actors_gpu, actors_host)  # type: ignore[attr-defined]
+                # Obstacles
+                obstacle_steps = np.int32(0)
+                num_obstacles = np.int32(len(obstacles))
+                if num_obstacles > 0:
+                    obstacle_sequences = []
+                    obstacle_extents = []
+                    max_steps = 0
+
+                    for obs in obstacles:
+                        if isinstance(obs, dict):
+                            states = obs.get("states")
+                            extent = obs.get("extent")
+                        else:
+                            try:
+                                states, extent = obs
+                            except (TypeError, ValueError):
+                                raise ValueError(
+                                    "Each obstacle must be a dict with 'states' and 'extent' or a (states, extent) tuple"
+                                ) from None
+
+                        if states is None or extent is None:
+                            raise ValueError(
+                                "Obstacle definitions require both states and extent information"
+                            )
+
+                        states_arr = np.asarray(states, dtype=np.float32)
+                        if states_arr.ndim != 2 or states_arr.shape[1] != 4:
+                            raise ValueError(
+                                "Obstacle states must be an array shaped (T, 4) of (x, y, v, theta)"
+                            )
+                        if states_arr.shape[0] == 0:
+                            raise ValueError(
+                                "Obstacle state sequences must include at least one timestep"
+                            )
+
+                        extent_arr = np.asarray(extent, dtype=np.float32)
+                        if extent_arr.shape != (2,):
+                            raise ValueError(
+                                "Obstacle extent must be an iterable of (dx, dy)"
+                            )
+
+                        obstacle_sequences.append(states_arr)
+                        obstacle_extents.append(extent_arr)
+                        if states_arr.shape[0] > max_steps:
+                            max_steps = states_arr.shape[0]
+
+                    obstacle_steps = np.int32(max_steps)
+
+                    padded_states = np.zeros(
+                        (int(num_obstacles), int(obstacle_steps), 4), dtype=np.float32
+                    )
+                    for idx, states_arr in enumerate(obstacle_sequences):
+                        steps = states_arr.shape[0]
+                        padded_states[idx, :steps, :] = states_arr
+                        if steps < obstacle_steps:
+                            padded_states[idx, steps:, :] = states_arr[-1]
+
+                    obstacle_states_host = padded_states.reshape(-1, 4)
+                    obstacle_extents_host = np.stack(obstacle_extents, axis=0)
+
+                    obstacles_gpu = _cuda.mem_alloc(obstacle_extents_host.nbytes)  # type: ignore[attr-defined]
+                    _cuda.memcpy_htod(obstacles_gpu, obstacle_extents_host)  # type: ignore[attr-defined]
+
+                    obstacle_states_gpu = _cuda.mem_alloc(obstacle_states_host.nbytes)  # type: ignore[attr-defined]
+                    _cuda.memcpy_htod(obstacle_states_gpu, obstacle_states_host)  # type: ignore[attr-defined]
 
                 # Nominal control & state trajectories
                 u_nom_host = np.array(u_nom, dtype=np.float32)
@@ -778,20 +1100,19 @@ class MPPI:
                 self.optimization_args["num_controls"] = np.int32(
                     num_controls_timesteps
                 )
-                self.optimization_args["num_obstacles"] = num_actors
+                self.optimization_args["num_obstacles"] = num_obstacles
+                self.optimization_args["obstacle_steps"] = obstacle_steps
                 self.optimization_args["x_init"] = np.array(x_init, dtype=np.float32)
                 self.optimization_args["x_goal"] = np.array(x_goal, dtype=np.float32)
                 _cuda.memcpy_htod(self.optimization_args_gpu, self.optimization_args)  # type: ignore[attr-defined]
 
                 # Kernel handles
-                perform_rollout_func = _COMPILED_MPPI_MODULE.get_function(
-                    "perform_rollout"
-                )
-                min_weight_func = _COMPILED_MPPI_MODULE.get_function("min_weight")
-                calculate_weights_func = _COMPILED_MPPI_MODULE.get_function(
+                perform_rollout_func = _COMPILED_MODULE.get_function("perform_rollout")
+                min_weight_func = _COMPILED_MODULE.get_function("min_weight")
+                calculate_weights_func = _COMPILED_MODULE.get_function(
                     "calculate_weights"
                 )
-                calculate_mppi_control_func = _COMPILED_MPPI_MODULE.get_function(
+                calculate_mppi_control_func = _COMPILED_MODULE.get_function(
                     "calculate_mppi_control"
                 )
 
@@ -806,7 +1127,8 @@ class MPPI:
                     self.costmap_args_gpu,
                     x_nom_gpu,
                     u_nom_gpu,
-                    actors_gpu,
+                    obstacles_gpu,
+                    obstacle_states_gpu,
                     self.optimization_args_gpu,
                     u_dist_gpu,
                     u_weight_gpu,
@@ -844,9 +1166,26 @@ class MPPI:
                     grid=grid_1d,
                 )
 
-                # Accumulate weighted disturbances into nominal
+                # Accumulate weighted disturbances in unconstrained control space.
+                # This avoids biasing saturated steering commands back toward zero.
+                u_limits_host = self.optimization_args["u_limits"][0]
+                unit_u_nom = np.zeros_like(u_nom_host)
+                unit_u_nom[:, 0] = np.clip(
+                    u_nom_host[:, 0]
+                    / max(float(u_limits_host[0]), np.finfo(np.float32).eps),
+                    -1.0 + 1e-5,
+                    1.0 - 1e-5,
+                )
+                unit_u_nom[:, 1] = np.clip(
+                    u_nom_host[:, 1]
+                    / max(float(u_limits_host[1]), np.finfo(np.float32).eps),
+                    -1.0 + 1e-5,
+                    1.0 - 1e-5,
+                )
+                u_nom_z_host = np.arctanh(unit_u_nom).astype(np.float32)
+
                 u_mppi_gpu = _cuda.mem_alloc(u_nom_host.nbytes)  # type: ignore[attr-defined]
-                _cuda.memcpy_dtod(u_mppi_gpu, u_nom_gpu, u_nom_host.nbytes)  # type: ignore[attr-defined]
+                _cuda.memcpy_htod(u_mppi_gpu, u_nom_z_host)  # type: ignore[attr-defined]
                 calculate_mppi_control_func(
                     self.samples,
                     u_nom_gpu,
@@ -854,6 +1193,7 @@ class MPPI:
                     np.int32(num_controls_timesteps),
                     u_weight_gpu,
                     u_weight_total_gpu,
+                    self.optimization_args_gpu,
                     u_mppi_gpu,
                     block=block_1d,
                     grid=grid_1d,
@@ -861,6 +1201,9 @@ class MPPI:
 
                 # Copy back
                 _cuda.memcpy_dtoh(u_mppi_host, u_mppi_gpu)  # type: ignore[attr-defined]
+                u_mppi_host[:, 0] = u_limits_host[0] * np.tanh(u_mppi_host[:, 0])
+                u_mppi_host[:, 1] = u_limits_host[1] * np.tanh(u_mppi_host[:, 1])
+
                 u_dist_raw_host = np.zeros(
                     self.samples * num_controls_timesteps * num_control_elements,
                     dtype=np.float32,
@@ -901,7 +1244,12 @@ class MPPI:
                 # Free GPU temporaries
                 for buf in [
                     costmap_gpu,
-                    actors_gpu if not isinstance(actors_gpu, int) else None,
+                    obstacles_gpu if not isinstance(obstacles_gpu, int) else None,
+                    (
+                        obstacle_states_gpu
+                        if not isinstance(obstacle_states_gpu, int)
+                        else None
+                    ),
                     u_nom_gpu,
                     x_nom_gpu,
                     u_mppi_gpu,
@@ -915,10 +1263,5 @@ class MPPI:
                             buf.free()
                     except Exception:
                         pass
-        finally:
-            try:
-                self.mppi_context.pop()
-            except Exception:
-                pass
 
         return u_mppi_host, u_dist_host_reshaped, u_weights_host
