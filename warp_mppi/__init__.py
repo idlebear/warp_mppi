@@ -12,8 +12,8 @@ try:
     WARP_AVAILABLE = True
 except ImportError as e:
     MPPI = None
+    WarpMPPI = None
     WARP_AVAILABLE = False
-    raise ImportError(f"Warp not available - cannot import MPPI controller: {e}")
 
 # Legacy PyCUDA implementation available on explicit import
 # from warp_mppi.legacy import PyCudaMPPI

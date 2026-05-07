@@ -2,6 +2,7 @@ import atexit  # For ensuring context cleanup on exit
 import contextlib
 import functools
 import numpy as np
+from time import perf_counter
 
 import pycuda.gpuarray as gpuarray
 import pycuda.driver as cuda
@@ -13,13 +14,20 @@ from pycuda import characterize
 import sys
 from typing import Any
 
+try:
+    from .trajectory_eval_pycuda import score_oce_scene_rollouts_device
+except Exception as _oce_import_error:  # pragma: no cover - optional OCE path
+    score_oce_scene_rollouts_device = None
+
 
 _cuda: Any = cuda  # alias to satisfy static analyzers
 
 # --- CUDA Context Management ---
 _MODULE_CONTEXT = None  # Stores the context active during SourceModule compilation
 _owns_module_context_ref = False  # True if this module must detach _MODULE_CONTEXT
-_module_context_pushed = False  # True while this module has _MODULE_CONTEXT on the stack
+_module_context_pushed = (
+    False  # True while this module has _MODULE_CONTEXT on the stack
+)
 
 
 def _establish_module_context():
@@ -108,6 +116,393 @@ atexit.register(_cleanup_context_atexit)
 
 
 BLOCK_SIZE = 32
+LARGE_COLLISION_COST = np.float32(1.0e7)
+
+
+def _actor_collision_geometry_from_extent(extent, buffer=0.0):
+    extent_arr = np.asarray(extent, dtype=np.float32).reshape(-1)
+    if extent_arr.size <= 0:
+        return np.zeros((3,), dtype=np.float32)
+
+    half_length = float(abs(extent_arr[0]))
+    half_width = float(abs(extent_arr[1])) if extent_arr.size > 1 else half_length
+    margin = max(0.0, float(buffer))
+    half_length += margin
+    half_width += margin
+
+    radius = max(min(half_length, half_width), 1.0e-3)
+    if half_length >= half_width:
+        offset_x = max(half_length - radius, 0.0)
+        offset_y = 0.0
+    else:
+        offset_x = 0.0
+        offset_y = max(half_width - radius, 0.0)
+
+    return np.asarray([radius, offset_x, offset_y], dtype=np.float32)
+
+
+def _legacy_extent_from_collision_geometry(collision_geometry):
+    radius, offset_x, offset_y = np.asarray(
+        collision_geometry, dtype=np.float32
+    ).reshape(3)
+    return np.asarray(
+        [radius + abs(offset_x), radius + abs(offset_y)], dtype=np.float32
+    )
+
+
+def _obstacle_polygon_points(obstacle):
+    if isinstance(obstacle, dict):
+        for key in ("polygon", "points", "vertices"):
+            if key in obstacle:
+                return obstacle[key]
+        return None
+    if hasattr(obstacle, "points"):
+        return obstacle.points
+    return None
+
+
+def _pack_polygon_obstacles(polygons):
+    if not polygons:
+        return np.zeros((0,), dtype=np.float32), np.zeros((1,), dtype=np.int32)
+
+    vertices = []
+    offsets = [0]
+    for polygon in polygons:
+        points = np.asarray(polygon, dtype=np.float32)
+        if points.ndim != 2 or points.shape[0] < 3 or points.shape[1] < 2:
+            continue
+        points = np.ascontiguousarray(points[:, :2], dtype=np.float32)
+        if points.shape[0] > 1 and np.allclose(points[0], points[-1]):
+            points = points[:-1]
+        if points.shape[0] < 3:
+            continue
+        vertices.append(points)
+        offsets.append(offsets[-1] + int(points.shape[0]))
+
+    if not vertices:
+        return np.zeros((0,), dtype=np.float32), np.zeros((1,), dtype=np.int32)
+
+    return (
+        np.ascontiguousarray(
+            np.concatenate(vertices, axis=0).reshape(-1), dtype=np.float32
+        ),
+        np.ascontiguousarray(offsets, dtype=np.int32),
+    )
+
+
+def _prepare_obstacle_batches(obstacles, horizon):
+    static_states = []
+    static_extents = []
+    dynamic_actors = []
+    static_polygons = []
+
+    for obstacle in obstacles if obstacles is not None else []:
+        polygon_points = _obstacle_polygon_points(obstacle)
+        if polygon_points is not None:
+            blocking = (
+                obstacle.get("blocking", True)
+                if isinstance(obstacle, dict)
+                else getattr(obstacle, "blocking", True)
+            )
+            if bool(blocking):
+                static_polygons.append(polygon_points)
+            continue
+
+        if isinstance(obstacle, dict):
+            states = np.asarray(obstacle.get("states", []), dtype=np.float32)
+            extent = obstacle.get("extent", (0.0, 0.0))
+            collision_buffer = obstacle.get("collision_buffer", 0.0)
+            is_static = bool(obstacle.get("static", False))
+            obstacle_id = obstacle.get("id")
+        else:
+            obstacle_arr = np.asarray(obstacle, dtype=np.float32).reshape(-1)
+            if obstacle_arr.size >= 9:
+                x, y, theta, radius, offset_x, offset_y = obstacle_arr[:6]
+                collision_geometry = np.asarray(
+                    [radius, offset_x, offset_y], dtype=np.float32
+                )
+                static_states.append(np.asarray([x, y, 0.0, theta], dtype=np.float32))
+                static_extents.append(
+                    _legacy_extent_from_collision_geometry(collision_geometry)
+                )
+            elif obstacle_arr.size >= 6:
+                x, y, radius, _min_x, _min_y, _distance = obstacle_arr[:6]
+                static_states.append(np.asarray([x, y, 0.0, 0.0], dtype=np.float32))
+                static_extents.append(np.asarray([radius, radius], dtype=np.float32))
+            continue
+
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        if states.ndim != 2 or states.shape[0] <= 0 or states.shape[1] < 2:
+            continue
+
+        collision_geometry = _actor_collision_geometry_from_extent(
+            extent, buffer=collision_buffer
+        )
+        if is_static or states.shape[0] <= 1:
+            state = np.zeros((4,), dtype=np.float32)
+            state_cols = min(4, states.shape[1])
+            state[:state_cols] = states[0, :state_cols]
+            static_states.append(state)
+            static_extents.append(
+                _legacy_extent_from_collision_geometry(collision_geometry)
+            )
+            continue
+
+        padded = np.zeros((horizon, 4), dtype=np.float32)
+        valid_steps = min(horizon, states.shape[0])
+        state_cols = min(4, states.shape[1])
+        padded[:valid_steps, :state_cols] = states[:valid_steps, :state_cols]
+        if valid_steps < horizon:
+            padded[valid_steps:, :] = padded[valid_steps - 1, :]
+        dynamic_actors.append(
+            {
+                "id": obstacle_id,
+                "states": padded,
+                "collision_geometry": np.asarray(collision_geometry, dtype=np.float32),
+                "extent": np.asarray(extent, dtype=np.float32).reshape(-1),
+                "collision_buffer": float(collision_buffer),
+            }
+        )
+
+    static_states_host = (
+        np.ascontiguousarray(np.stack(static_states, axis=0).astype(np.float32))
+        if static_states
+        else np.zeros((0, 4), dtype=np.float32)
+    )
+    static_extents_host = (
+        np.ascontiguousarray(np.stack(static_extents, axis=0).astype(np.float32))
+        if static_extents
+        else np.zeros((0, 2), dtype=np.float32)
+    )
+    polygon_vertices_host, polygon_offsets_host = _pack_polygon_obstacles(
+        static_polygons
+    )
+    return (
+        static_extents_host,
+        static_states_host,
+        dynamic_actors,
+        polygon_vertices_host,
+        polygon_offsets_host,
+    )
+
+
+def _pack_dynamic_actor_arrays(dynamic_actors):
+    if not dynamic_actors:
+        return np.zeros((0, 0, 4), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+    actor_states = np.ascontiguousarray(
+        np.stack(
+            [np.asarray(actor["states"], dtype=np.float32) for actor in dynamic_actors],
+            axis=0,
+        ).astype(np.float32, copy=False)
+    )
+    actor_collision_geometry = np.ascontiguousarray(
+        np.stack(
+            [
+                np.asarray(actor["collision_geometry"], dtype=np.float32)
+                for actor in dynamic_actors
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+    )
+    return actor_states, actor_collision_geometry
+
+
+def _resolve_oce_payload(oce_data):
+    if oce_data is None or oce_data is False:
+        return None, None, "kde", 1.0e-9, 1.0, False, False, None
+    if isinstance(oce_data, dict):
+        if not bool(oce_data.get("enabled", True)):
+            return None, None, "kde", 1.0e-9, 1.0, False, False, None
+        scene = oce_data.get("scene")
+        config = oce_data.get("oce_config", oce_data.get("config"))
+        scorer = oce_data.get("scorer", oce_data.get("score_func"))
+        entropy_space = oce_data.get(
+            "entropy_space",
+            (
+                getattr(config, "oce_entropy_space", "kde")
+                if config is not None
+                else "kde"
+            ),
+        )
+        eps = float(oce_data.get("eps", getattr(config, "eps", 1.0e-9)))
+        discount = float(oce_data.get("discount", getattr(config, "oce_discount", 1.0)))
+        materialize_host = bool(oce_data.get("materialize_host", False))
+        return_visibility_tensor = bool(oce_data.get("return_visibility_tensor", False))
+        return (
+            scene,
+            config,
+            entropy_space,
+            eps,
+            discount,
+            materialize_host,
+            return_visibility_tensor,
+            scorer,
+        )
+    return oce_data, None, "kde", 1.0e-9, 1.0, False, False, None
+
+
+def _circle_centers_from_pose(x, y, theta, offset_x, offset_y):
+    local = np.asarray(
+        [[-offset_x, -offset_y], [0.0, 0.0], [offset_x, offset_y]],
+        dtype=np.float32,
+    )
+    c = np.cos(theta)
+    s = np.sin(theta)
+    rotation = np.asarray([[c, -s], [s, c]], dtype=np.float32)
+    return local @ rotation.T + np.asarray([x, y], dtype=np.float32)
+
+
+def _dynamic_rollout_clearance_summary(
+    rollout_states,
+    actor_states,
+    actor_collision_geometry,
+    ego_collision_geometry,
+):
+    if rollout_states is None or actor_states is None or actor_states.size == 0:
+        return {"num_dynamic_actors": 0, "colliding_samples": 0, "min_clearance": None}
+
+    rollout_states = np.asarray(rollout_states, dtype=np.float32)
+    actor_states = np.asarray(actor_states, dtype=np.float32)
+    actor_collision_geometry = np.asarray(actor_collision_geometry, dtype=np.float32)
+    ego_radius, ego_offset_x, ego_offset_y = np.asarray(
+        ego_collision_geometry, dtype=np.float32
+    ).reshape(3)
+
+    sample_min = np.full(rollout_states.shape[0], np.inf, dtype=np.float32)
+    for sample_idx in range(rollout_states.shape[0]):
+        for step_idx in range(rollout_states.shape[1]):
+            ego = rollout_states[sample_idx, step_idx]
+            ego_centers = _circle_centers_from_pose(
+                ego[0], ego[1], ego[3], ego_offset_x, ego_offset_y
+            )
+            for actor_idx in range(actor_states.shape[0]):
+                actor_radius, actor_offset_x, actor_offset_y = actor_collision_geometry[
+                    actor_idx
+                ]
+                actor = actor_states[actor_idx, step_idx]
+                actor_centers = _circle_centers_from_pose(
+                    actor[0], actor[1], actor[3], actor_offset_x, actor_offset_y
+                )
+                distances = np.linalg.norm(
+                    ego_centers[:, np.newaxis, :] - actor_centers[np.newaxis, :, :],
+                    axis=2,
+                )
+                clearance = np.min(distances) - (ego_radius + actor_radius)
+                if clearance < sample_min[sample_idx]:
+                    sample_min[sample_idx] = clearance
+
+    finite = np.isfinite(sample_min)
+    if not np.any(finite):
+        return {
+            "num_dynamic_actors": int(actor_states.shape[0]),
+            "colliding_samples": 0,
+            "min_clearance": None,
+        }
+
+    return {
+        "num_dynamic_actors": int(actor_states.shape[0]),
+        "colliding_samples": int(np.count_nonzero(sample_min[finite] < 0.0)),
+        "min_clearance": float(np.min(sample_min[finite])),
+        "mean_min_clearance": float(np.mean(sample_min[finite])),
+    }
+
+
+def _summarize_dynamic_actors(dynamic_actors, ego_collision_geometry):
+    ego_radius, ego_offset_x, ego_offset_y = np.asarray(
+        ego_collision_geometry, dtype=np.float32
+    ).reshape(3)
+    summary = []
+    for idx, actor in enumerate(dynamic_actors):
+        states = np.asarray(actor.get("states", []), dtype=np.float32)
+        geometry = np.asarray(
+            actor.get("collision_geometry", np.zeros(3, dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape(3)
+        item = {
+            "index": int(idx),
+            "id": actor.get("id"),
+            "steps": int(states.shape[0]) if states.ndim >= 2 else 0,
+            "radius": float(geometry[0]),
+            "offset_x": float(geometry[1]),
+            "offset_y": float(geometry[2]),
+            "ego_radius": float(ego_radius),
+            "ego_offset_x": float(ego_offset_x),
+            "ego_offset_y": float(ego_offset_y),
+            "combined_circle_radius": float(geometry[0] + ego_radius),
+            "extent": (
+                np.asarray(actor.get("extent"), dtype=float).reshape(-1).tolist()
+                if actor.get("extent") is not None
+                else None
+            ),
+            "collision_buffer": float(actor.get("collision_buffer", 0.0)),
+        }
+        if states.ndim == 2 and states.shape[0] > 0:
+            item["start"] = states[0, : min(4, states.shape[1])].astype(float).tolist()
+            item["end"] = states[-1, : min(4, states.shape[1])].astype(float).tolist()
+        summary.append(item)
+    return summary
+
+
+def _summarize_weights_and_costs(
+    weights,
+    total_costs,
+    dynamic_costs,
+    samples,
+    dynamic_collision_cost,
+):
+    weights = np.asarray(weights, dtype=np.float32).reshape(-1)
+    total_costs = np.asarray(total_costs, dtype=np.float32).reshape(-1)
+    dynamic_costs = np.asarray(dynamic_costs, dtype=np.float32).reshape(-1)
+    weight_sum = float(np.sum(weights))
+    weight_sq_sum = float(np.sum(weights * weights))
+    ess = (weight_sum * weight_sum) / (weight_sq_sum + 1.0e-12)
+    mean_weight = float(np.mean(weights)) if weights.size else 0.0
+    dynamic_collision_threshold = 0.5 * float(dynamic_collision_cost)
+    dynamic_nonzero = int(np.count_nonzero(dynamic_costs > 0.0))
+    dynamic_hard = int(np.count_nonzero(dynamic_costs >= dynamic_collision_threshold))
+
+    return {
+        "weights": {
+            "sum": weight_sum,
+            "min": float(np.min(weights)) if weights.size else 0.0,
+            "max": float(np.max(weights)) if weights.size else 0.0,
+            "mean": mean_weight,
+            "std": float(np.std(weights)) if weights.size else 0.0,
+            "nonzero": int(np.count_nonzero(weights > 0.0)),
+            "ess": float(ess),
+            "ess_pct": float(ess / max(float(samples), 1.0) * 100.0),
+            "nearly_equal": bool(
+                weights.size > 0
+                and np.allclose(weights, mean_weight, rtol=1.0e-3, atol=1.0e-8)
+            ),
+        },
+        "total_costs": {
+            "min": float(np.min(total_costs)) if total_costs.size else 0.0,
+            "max": float(np.max(total_costs)) if total_costs.size else 0.0,
+            "mean": float(np.mean(total_costs)) if total_costs.size else 0.0,
+            "std": float(np.std(total_costs)) if total_costs.size else 0.0,
+            "range": (
+                float(np.max(total_costs) - np.min(total_costs))
+                if total_costs.size
+                else 0.0
+            ),
+        },
+        "dynamic_costs": {
+            "min": float(np.min(dynamic_costs)) if dynamic_costs.size else 0.0,
+            "max": float(np.max(dynamic_costs)) if dynamic_costs.size else 0.0,
+            "mean": float(np.mean(dynamic_costs)) if dynamic_costs.size else 0.0,
+            "std": float(np.std(dynamic_costs)) if dynamic_costs.size else 0.0,
+            "nonzero": dynamic_nonzero,
+            "hard_collision_like": dynamic_hard,
+            "all_zero": bool(dynamic_costs.size > 0 and dynamic_nonzero == 0),
+            "all_hard_collision_like": bool(
+                dynamic_costs.size > 0 and dynamic_hard == dynamic_costs.size
+            ),
+        },
+    }
+
 
 # CUDA source (kernels) -------------------------------------------------------
 _MPPI_CUDA_SOURCE = """
@@ -146,6 +541,7 @@ _MPPI_CUDA_SOURCE = """
         int num_controls;
         int num_obstacles;
         int obstacle_steps;
+        int num_polygon_obstacles;
         float x_init[4];
         float x_goal[4];
         float u_limits[2];
@@ -158,7 +554,11 @@ _MPPI_CUDA_SOURCE = """
         float scan_range;
         float vehicle_length;
         float vehicle_width;
-    float steering_rate_weight; // added optional penalty weight
+        float steering_rate_weight; // added optional penalty weight
+        float static_collision_cost;
+        float static_hard_clearance_margin;
+        float static_clearance_margin;
+        float static_clearance_weight;
     };
 
     struct Obstacle {
@@ -277,12 +677,12 @@ _MPPI_CUDA_SOURCE = """
         const State obstacle_state = obstacle_states[i * obstacle_steps + clamped_step];
         const float obs_extent_x = obstacles[i].dx;
         const float obs_extent_y = obstacles[i].dy;
-        const float obs_radius = obs_extent_y;
-        const float obs_offset = fmaxf(obs_extent_x - obs_extent_y, 0.0f) / 2.0f;
+        const float obs_radius = fminf(obs_extent_x, obs_extent_y);
+        const float obs_offset = fmaxf(obs_extent_x - obs_radius, 0.0f);
 
         const float obs_cos_theta = cosf(obstacle_state.theta);
         const float obs_sin_theta = sinf(obstacle_state.theta);
-        const int obs_circles = (ego_offset <= 0.0f) ? 1 : 3;
+        const int obs_circles = (obs_offset <= 0.0f) ? 1 : 3;
 
         // 3x3 circle checks
         for (int ego_circle_idx = 0; ego_circle_idx < ego_circles; ++ego_circle_idx) {
@@ -313,6 +713,289 @@ _MPPI_CUDA_SOURCE = """
       }
 
       return 0.0f;
+    }
+
+    __device__ __forceinline__
+    float point_segment_distance_sq(
+        float px,
+        float py,
+        float ax,
+        float ay,
+        float bx,
+        float by
+    ) {
+        const float abx = bx - ax;
+        const float aby = by - ay;
+        const float apx = px - ax;
+        const float apy = py - ay;
+        const float ab_len_sq = abx * abx + aby * aby;
+        float t = 0.0f;
+        if (ab_len_sq > FLT_EPSILON) {
+            t = fminf(fmaxf((apx * abx + apy * aby) / ab_len_sq, 0.0f), 1.0f);
+        }
+        const float cx = ax + t * abx;
+        const float cy = ay + t * aby;
+        const float dx = px - cx;
+        const float dy = py - cy;
+        return dx * dx + dy * dy;
+    }
+
+    __device__ __forceinline__
+    bool point_in_polygon(
+        float px,
+        float py,
+        const float *polygon_vertices,
+        int start,
+        int end
+    ) {
+        bool inside = false;
+        int previous = end - 1;
+        for (int current = start; current < end; ++current) {
+            const float xi = polygon_vertices[current * 2 + 0];
+            const float yi = polygon_vertices[current * 2 + 1];
+            const float xj = polygon_vertices[previous * 2 + 0];
+            const float yj = polygon_vertices[previous * 2 + 1];
+            const bool crosses = ((yi > py) != (yj > py));
+            if (crosses) {
+                const float x_intersect = (xj - xi) * (py - yi) / (yj - yi + FLT_EPSILON) + xi;
+                if (px < x_intersect) {
+                    inside = !inside;
+                }
+            }
+            previous = current;
+        }
+        return inside;
+    }
+
+    __device__ __forceinline__
+    bool circle_intersects_polygon(
+        float cx,
+        float cy,
+        float radius,
+        const float *polygon_vertices,
+        int start,
+        int end
+    ) {
+        if (end - start < 3) {
+            return false;
+        }
+        if (point_in_polygon(cx, cy, polygon_vertices, start, end)) {
+            return true;
+        }
+
+        const float radius_sq = radius * radius;
+        int previous = end - 1;
+        for (int current = start; current < end; ++current) {
+            const float ax = polygon_vertices[previous * 2 + 0];
+            const float ay = polygon_vertices[previous * 2 + 1];
+            const float bx = polygon_vertices[current * 2 + 0];
+            const float by = polygon_vertices[current * 2 + 1];
+            if (point_segment_distance_sq(cx, cy, ax, ay, bx, by) <= radius_sq) {
+                return true;
+            }
+            previous = current;
+        }
+        return false;
+    }
+
+    __device__ __forceinline__
+    float circle_polygon_clearance(
+        float cx,
+        float cy,
+        float radius,
+        const float *polygon_vertices,
+        int start,
+        int end
+    ) {
+        if (end - start < 3) {
+            return FLT_MAX;
+        }
+
+        float min_dist_sq = FLT_MAX;
+        int previous = end - 1;
+        for (int current = start; current < end; ++current) {
+            const float ax = polygon_vertices[previous * 2 + 0];
+            const float ay = polygon_vertices[previous * 2 + 1];
+            const float bx = polygon_vertices[current * 2 + 0];
+            const float by = polygon_vertices[current * 2 + 1];
+            min_dist_sq = fminf(
+                min_dist_sq,
+                point_segment_distance_sq(cx, cy, ax, ay, bx, by)
+            );
+            previous = current;
+        }
+
+        if (point_in_polygon(cx, cy, polygon_vertices, start, end)) {
+            return -radius;
+        }
+        return sqrtf(min_dist_sq) - radius;
+    }
+
+    __device__
+    float polygon_obstacle_cost(
+        const float *polygon_vertices,
+        const int *polygon_offsets,
+        int num_polygon_obstacles,
+        float px,
+        float py,
+        float p_theta,
+        float vehicle_length,
+        float vehicle_width,
+        float collision_penalty,
+        float hard_clearance_margin,
+        float clearance_margin,
+        float clearance_weight
+    ) {
+        if (num_polygon_obstacles <= 0 || polygon_vertices == NULL || polygon_offsets == NULL) {
+            return 0.0f;
+        }
+
+        float cost = 0.0f;
+        const float ego_radius = vehicle_width / 2.0f;
+        const float ego_offset = fmaxf(vehicle_length - vehicle_width, 0.0f) / 2.0f;
+        const float ego_cos_theta = cosf(p_theta);
+        const float ego_sin_theta = sinf(p_theta);
+        const int ego_circles = (ego_offset <= 0.0f) ? 1 : 3;
+
+        for (int polygon_idx = 0; polygon_idx < num_polygon_obstacles; ++polygon_idx) {
+            const int start = polygon_offsets[polygon_idx];
+            const int end = polygon_offsets[polygon_idx + 1];
+            for (int ego_circle_idx = 0; ego_circle_idx < ego_circles; ++ego_circle_idx) {
+                float ego_dist_along = 0.0f;
+                if (ego_circle_idx == 1) ego_dist_along = ego_offset;
+                else if (ego_circle_idx == 2) ego_dist_along = -ego_offset;
+
+                const float ego_cx = px + ego_dist_along * ego_cos_theta;
+                const float ego_cy = py + ego_dist_along * ego_sin_theta;
+                float clearance = circle_polygon_clearance(
+                    ego_cx,
+                    ego_cy,
+                    ego_radius,
+                    polygon_vertices,
+                    start,
+                    end
+                );
+                if (clearance < 0.0f) {
+                    return collision_penalty;
+                }
+                const float active_clearance_margin = fmaxf(clearance_margin, hard_clearance_margin);
+                if (active_clearance_margin > 0.0f && clearance_weight > 0.0f && clearance < active_clearance_margin) {
+                    float deficit = active_clearance_margin - clearance;
+                    cost += clearance_weight * deficit * deficit;
+                }
+            }
+        }
+        return cost;
+    }
+
+    __device__ __forceinline__
+    void circle_center_from_pose(
+        float x,
+        float y,
+        float theta,
+        float offset_x,
+        float offset_y,
+        int circle_idx,
+        float *cx,
+        float *cy
+    ) {
+        float local_x = 0.0f;
+        float local_y = 0.0f;
+        if (circle_idx == 0) {
+            local_x = -offset_x;
+            local_y = -offset_y;
+        } else if (circle_idx == 2) {
+            local_x = offset_x;
+            local_y = offset_y;
+        }
+
+        const float cos_theta = cosf(theta);
+        const float sin_theta = sinf(theta);
+        *cx = x + local_x * cos_theta - local_y * sin_theta;
+        *cy = y + local_x * sin_theta + local_y * cos_theta;
+    }
+
+    __device__ __forceinline__
+    bool three_circle_collision(
+        float ax,
+        float ay,
+        float atheta,
+        float aradius,
+        float aoffset_x,
+        float aoffset_y,
+        float bx,
+        float by,
+        float btheta,
+        float bradius,
+        float boffset_x,
+        float boffset_y
+    ) {
+        float min_dist = aradius + bradius;
+        float min_dist_sq = min_dist * min_dist;
+
+        float a_cx[3];
+        float a_cy[3];
+        float b_cx[3];
+        float b_cy[3];
+
+        for (int i = 0; i < 3; ++i) {
+            circle_center_from_pose(ax, ay, atheta, aoffset_x, aoffset_y, i, &a_cx[i], &a_cy[i]);
+            circle_center_from_pose(bx, by, btheta, boffset_x, boffset_y, i, &b_cx[i], &b_cy[i]);
+        }
+
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                float dx = a_cx[i] - b_cx[j];
+                float dy = a_cy[i] - b_cy[j];
+                if ((dx * dx + dy * dy) < min_dist_sq) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    __device__ __forceinline__
+    float three_circle_min_clearance(
+        float ax,
+        float ay,
+        float atheta,
+        float aradius,
+        float aoffset_x,
+        float aoffset_y,
+        float bx,
+        float by,
+        float btheta,
+        float bradius,
+        float boffset_x,
+        float boffset_y
+    ) {
+        float min_clearance = FLT_MAX;
+        float min_dist = aradius + bradius;
+
+        float a_cx[3];
+        float a_cy[3];
+        float b_cx[3];
+        float b_cy[3];
+
+        for (int i = 0; i < 3; ++i) {
+            circle_center_from_pose(ax, ay, atheta, aoffset_x, aoffset_y, i, &a_cx[i], &a_cy[i]);
+            circle_center_from_pose(bx, by, btheta, boffset_x, boffset_y, i, &b_cx[i], &b_cy[i]);
+        }
+
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                float dx = a_cx[i] - b_cx[j];
+                float dy = a_cy[i] - b_cy[j];
+                float clearance = sqrtf(dx * dx + dy * dy) - min_dist;
+                if (clearance < min_clearance) {
+                    min_clearance = clearance;
+                }
+            }
+        }
+
+        return min_clearance;
     }
 
 
@@ -534,9 +1217,13 @@ _MPPI_CUDA_SOURCE = """
             const Control *u_nom,   // nominal controls, num_controls x control_size
             const Obstacle *obstacles,
             const State *obstacle_states,
+            const float *polygon_vertices,
+            const int *polygon_offsets,
             const Optimization_Params *optimization_args,
             Control *u_dists,
-            float *u_weights
+            State *rollout_states,
+            float *u_weights,
+            float *component_costs
     ) {
         int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
         int samples = optimization_args->samples;
@@ -546,6 +1233,7 @@ _MPPI_CUDA_SOURCE = """
             int num_controls = optimization_args->num_controls;
             int num_obstacles = optimization_args->num_obstacles;
             int obstacle_steps = optimization_args->obstacle_steps;
+            int num_polygon_obstacles = optimization_args->num_polygon_obstacles;
             // float M = optimization_args->M;
             float dt = optimization_args->dt;
             const float *u_limits = optimization_args->u_limits;
@@ -563,6 +1251,10 @@ _MPPI_CUDA_SOURCE = """
             float control_err = 0.0;
             float obstacle_err = 0.0;
             float visibility_err = 0.0;
+            float sample_state_cost = 0.0;
+            float sample_control_cost = 0.0;
+            float sample_static_cost = 0.0;
+            float sample_visibility_cost = 0.0;
 
             // rollout the trajectory -- assume we are placing the result in the larger u_dist/u_weight arrays
             const State *x_init_state = reinterpret_cast<const State *>(optimization_args->x_init);
@@ -580,6 +1272,9 @@ _MPPI_CUDA_SOURCE = """
                 // runge_kutta_step returns derivative, we multiply by dt here
                 runge_kutta_step(&current_state, &c, optimization_args->vehicle_length, dt, &state_step);
                 update_state(&current_state, &state_step, dt, &current_state);
+                if (rollout_states != NULL) {
+                    rollout_states[sample_index * num_controls + (i - 1)] = current_state;
+                }
 
                 // penalize error in trajectory
                 auto theta_diff = x_nom[i].theta - current_state.theta;
@@ -626,6 +1321,20 @@ _MPPI_CUDA_SOURCE = """
                     optimization_args->vehicle_length,
                     optimization_args->vehicle_width
                 );
+                obstacle_err += polygon_obstacle_cost(
+                    polygon_vertices,
+                    polygon_offsets,
+                    num_polygon_obstacles,
+                    current_state.x,
+                    current_state.y,
+                    current_state.theta,
+                    optimization_args->vehicle_length,
+                    optimization_args->vehicle_width,
+                    optimization_args->static_collision_cost,
+                    optimization_args->static_hard_clearance_margin,
+                    optimization_args->static_clearance_margin,
+                    optimization_args->static_clearance_weight
+                );
 
                 // penalize visibility
                 visibility_err = 0;
@@ -664,6 +1373,10 @@ _MPPI_CUDA_SOURCE = """
                 // NO_VISIBILITY and INFO_GAIN_LIKE (if it implies using 'our_cost' already handled by OURS) might not need explicit handling here if OURS covers INFO_GAIN_LIKE
 
                 score += state_err + final_state_err + control_err + obstacle_err + visibility_err;
+                sample_state_cost += state_err + final_state_err;
+                sample_control_cost += control_err;
+                sample_static_cost += obstacle_err;
+                sample_visibility_cost += visibility_err;
 
                 if( isnan(score) ){
                     // printf( "score overflow -- prev score: %f, state: %f, final: %f, control: %f, obstacle: %f, visibility: %f\\n", prev_score, state_err, final_state_err, control_err, obstacle_err, visibility_err );
@@ -673,6 +1386,107 @@ _MPPI_CUDA_SOURCE = """
                 // prev_score = score;
             }
             u_weights[sample_index] = score;
+            if (component_costs != NULL) {
+                int component_base = sample_index * 5;
+                component_costs[component_base + 0] = sample_state_cost;
+                component_costs[component_base + 1] = sample_control_cost;
+                component_costs[component_base + 2] = sample_static_cost;
+                component_costs[component_base + 3] = sample_visibility_cost;
+                component_costs[component_base + 4] = 0.0f;
+            }
+        }
+    }
+
+    extern "C" __global__
+    void add_dynamic_collision_costs(
+            const State *rollout_states,
+            const float *actor_states,
+            const float *actor_collision_geometry,
+            int samples,
+            int num_controls,
+            int num_dynamic_actors,
+            float ego_circle_radius,
+            float ego_circle_offset_x,
+            float ego_circle_offset_y,
+            float collision_penalty,
+            float clearance_margin,
+            float clearance_weight,
+            float *dynamic_costs,
+            float *sample_costs
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            bool collided = false;
+            float dynamic_cost = 0.0f;
+            float min_clearance = FLT_MAX;
+
+            for (int actor_idx = 0; actor_idx < num_dynamic_actors; ++actor_idx) {
+                int actor_base = actor_idx * num_controls * 4;
+                int geometry_base = actor_idx * 3;
+                float actor_circle_radius = actor_collision_geometry[geometry_base + 0];
+                float actor_circle_offset_x = actor_collision_geometry[geometry_base + 1];
+                float actor_circle_offset_y = actor_collision_geometry[geometry_base + 2];
+
+                for (int step_idx = 0; step_idx < num_controls; ++step_idx) {
+                    const State ego_state = rollout_states[sample_index * num_controls + step_idx];
+                    int actor_offset = actor_base + step_idx * 4;
+                    float clearance = three_circle_min_clearance(
+                        ego_state.x,
+                        ego_state.y,
+                        ego_state.theta,
+                        ego_circle_radius,
+                        ego_circle_offset_x,
+                        ego_circle_offset_y,
+                        actor_states[actor_offset + 0],
+                        actor_states[actor_offset + 1],
+                        actor_states[actor_offset + 3],
+                        actor_circle_radius,
+                        actor_circle_offset_x,
+                        actor_circle_offset_y
+                    );
+                    if (clearance < min_clearance) {
+                        min_clearance = clearance;
+                    }
+                    if (clearance < 0.0f) {
+                        collided = true;
+                        // printf( "Sample %d, Actor %d, Step %d: Collision detected ( %f / %f)  -- Ego state: (x: %f, y: %f, theta: %f)  -- Actor state: (x: %f, y: %f, theta: %f)\\n",
+                        //         sample_index, actor_idx, step_idx, clearance, min_clearance, ego_state.x, ego_state.y, ego_state.theta,
+                        //         actor_states[actor_offset + 0], actor_states[actor_offset + 1], actor_states[actor_offset + 3]  );
+                    } else if (clearance_margin > 0.0f && clearance_weight > 0.0f && clearance < clearance_margin) {
+                        float deficit = clearance_margin - clearance;
+                        dynamic_cost += clearance_weight * deficit * deficit;
+                        // printf( "Sample %d, Actor %d, Step %d: Clearance penalty (clearance = %f, deficit = %f, incremental cost = %f) -- Ego state: (x: %f, y: %f, theta: %f)  -- Actor state: (x: %f, y: %f, theta: %f)\\n",
+                        //         sample_index, actor_idx, step_idx, clearance, deficit, clearance_weight * deficit * deficit, ego_state.x, ego_state.y, ego_state.theta,
+                        //         actor_states[actor_offset + 0], actor_states[actor_offset + 1], actor_states[actor_offset + 3] );
+                    }
+                }
+            }
+
+            if (collided) {
+                dynamic_cost += collision_penalty;
+            }
+
+            if( dynamic_cost > 0.0f ){
+                // printf( "***\\n Sample %d: dynamic cost = %f (min clearance = %f, collided = %d) -- clearance margin: %f, clearance weight: %f, collision penalty: %f\\n",
+                //         sample_index, dynamic_cost, min_clearance, collided, clearance_margin, clearance_weight, collision_penalty );
+            }
+            sample_costs[sample_index] += dynamic_cost;
+            if (dynamic_costs != NULL) {
+                dynamic_costs[sample_index] = dynamic_cost;
+            }
+        }
+    }
+
+    extern "C" __global__
+    void add_sample_costs(
+            float *sample_costs,
+            const float *extra_costs,
+            int samples
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            sample_costs[sample_index] += extra_costs[sample_index];
         }
     }
 
@@ -745,6 +1559,51 @@ _MPPI_CUDA_SOURCE = """
       }
     }
 
+    extern "C" __global__
+    void filter_dynamic_collision_weights(
+            int samples,
+            float *u_weights,
+            const float *dynamic_costs,
+            float collision_threshold,
+            float *u_weight_total
+    ) {
+      int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+
+      for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+        float weight = u_weights[sample_index];
+        if (dynamic_costs[sample_index] >= collision_threshold) {
+            weight = 0.0f;
+            u_weights[sample_index] = 0.0f;
+        }
+        if (weight > 0.0f && !isnan(weight)) {
+            atomicAdd(u_weight_total, weight);
+        }
+      }
+    }
+
+    extern "C" __global__
+    void filter_static_collision_weights(
+            int samples,
+            float *u_weights,
+            const float *component_costs,
+            float collision_threshold,
+            float *u_weight_total
+    ) {
+      int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+
+      for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+        float weight = u_weights[sample_index];
+        float static_cost = component_costs[sample_index * 5 + 2];
+        if (static_cost >= collision_threshold) {
+            weight = 0.0f;
+            u_weights[sample_index] = 0.0f;
+        }
+        if (weight > 0.0f && !isnan(weight)) {
+            atomicAdd(u_weight_total, weight);
+        }
+      }
+    }
+
 
     extern "C" __global__
     void calculate_mppi_control(
@@ -766,7 +1625,7 @@ _MPPI_CUDA_SOURCE = """
         if (!is_zero(u_weight_total_float)) {
             weight_normalized = u_weights[sample_idx] / u_weight_total_float;
         } else {
-            weight_normalized = 1.0f/samples; // If total weight is zero, normalize to equal distribution
+            return;
         }
 
         for (int ctrl_idx = 0; ctrl_idx < num_controls; ++ctrl_idx) {
@@ -808,6 +1667,69 @@ except Exception as e:
     raise
 
 
+class CudaBufferCache:
+    """Reusable device buffers for end-to-end CUDA execution."""
+
+    def __init__(self):
+        self._capacity = {}
+        self._buffers = {}
+
+    def reserve_data(self, name, required_capacity, zero_fill=False):
+        current = self._capacity.get(name, 0)
+        buf = self._buffers.get(name)
+
+        if buf is None or current < required_capacity:
+            if buf is not None:
+                try:
+                    buf.free()
+                except Exception:
+                    pass
+
+            # make required_capacity a multiple of 32 bytes to reduce churn
+            required_capacity = ((required_capacity + 31) // 32) * 32
+            buf = _cuda.mem_alloc(required_capacity)
+            self._buffers[name] = buf
+            self._capacity[name] = required_capacity
+        else:
+            required_capacity = (
+                (required_capacity + 3) // 4 * 4
+            )  # round up to multiple of 4 bytes for memset_d32
+
+        if zero_fill:
+            _cuda.memset_d32(buf, 0, required_capacity // 4)
+
+        return buf
+
+    def reserve_array(self, name, arr):
+        buf = self.reserve_data(name, arr.nbytes, zero_fill=False)
+        _cuda.memcpy_htod(buf, arr)
+        return buf
+
+    def get(self, name):
+        return self._buffers.get(name)
+
+    def release(self):
+        for name, buf in list(self._buffers.items()):
+            if buf is not None:
+                try:
+                    buf.free()
+                except Exception:
+                    print(f"Warning: failed to free CUDA buffer '{name}'")
+                    pass
+            self._buffers[name] = None
+            self._capacity[name] = 0
+
+    def __del__(self):  # pragma: no cover - best effort cleanup
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+global _cuda_buffer_cache
+_cuda_buffer_cache = CudaBufferCache()
+
+
 class MPPI:
 
     visibility_methods = {
@@ -818,6 +1740,7 @@ class MPPI:
         "Higgins": 1,  # CUDA: HIGGINS
         "Andersen": 2,  # CUDA: ANDERSEN
         "Nominal": 3,  # CUDA: NO_VISIBILITY (i.e., no explicit visibility cost term)
+        "OCE": 3,  # Rollout visibility disabled; OCE is applied in a second stage.
         "Infogain": 0,  # CUDA: OURS (assuming 'our_cost' handles infogain maps)
         "Dynamic": 0,  # Alias for Ours
         # If Infogain is a distinct CUDA method INFO_GAIN_LIKE (4), map to 4.
@@ -833,6 +1756,7 @@ class MPPI:
             ("num_controls", np.int32),
             ("num_obstacles", np.int32),
             ("obstacle_steps", np.int32),
+            ("num_polygon_obstacles", np.int32),
             ("x_init", np.float32, 4),
             ("x_goal", np.float32, 4),
             ("u_limits", np.float32, 2),
@@ -846,6 +1770,10 @@ class MPPI:
             ("vehicle_length", np.float32),
             ("vehicle_width", np.float32),
             ("steering_rate_weight", np.float32),
+            ("static_collision_cost", np.float32),
+            ("static_hard_clearance_margin", np.float32),
+            ("static_clearance_margin", np.float32),
+            ("static_clearance_weight", np.float32),
         ]
     )
 
@@ -876,6 +1804,13 @@ class MPPI:
         scan_range,
         debug=False,
         steering_rate_weight=0.0,
+        dynamic_clearance_margin=0.5,
+        dynamic_clearance_weight=100.0,
+        dynamic_collision_cost=float(LARGE_COLLISION_COST),
+        static_clearance_margin=0.0,
+        static_clearance_weight=0.0,
+        static_collision_cost=float(LARGE_COLLISION_COST),
+        static_hard_clearance_margin=0.0,
     ):
         """Initialize MPPI controller.
 
@@ -888,6 +1823,19 @@ class MPPI:
         self.mppi_context = _MODULE_CONTEXT
         self.samples = np.int32(samples)
         self.debug = debug
+        self.vehicle_length = float(vehicle_length)
+        self.vehicle_width = float(vehicle_width)
+        self.dynamic_clearance_margin = float(dynamic_clearance_margin)
+        self.dynamic_clearance_weight = float(dynamic_clearance_weight)
+        self.dynamic_collision_cost = float(dynamic_collision_cost)
+        self.static_clearance_margin = float(static_clearance_margin)
+        self.static_clearance_weight = float(static_clearance_weight)
+        self.static_collision_cost = float(static_collision_cost)
+        self.static_hard_clearance_margin = float(static_hard_clearance_margin)
+        self.dynamic_clearance_diagnostics = bool(debug)
+        self.ego_collision_geometry = _actor_collision_geometry_from_extent(
+            (self.vehicle_length / 2.0, self.vehicle_width / 2.0)
+        )
 
         # Host-side struct (single element array for ease of memcpy)
         self.optimization_args = np.zeros(1, dtype=MPPI.optimization_dtype)
@@ -912,6 +1860,18 @@ class MPPI:
         self.optimization_args["vehicle_width"] = np.float32(vehicle_width)
         self.optimization_args["steering_rate_weight"] = np.float32(
             steering_rate_weight
+        )
+        self.optimization_args["static_collision_cost"] = np.float32(
+            self.static_collision_cost
+        )
+        self.optimization_args["static_hard_clearance_margin"] = np.float32(
+            self.static_hard_clearance_margin
+        )
+        self.optimization_args["static_clearance_margin"] = np.float32(
+            self.static_clearance_margin
+        )
+        self.optimization_args["static_clearance_weight"] = np.float32(
+            self.static_clearance_weight
         )
 
         # Allocate GPU buffers inside context
@@ -947,11 +1907,30 @@ class MPPI:
         self.last_cost_min = None
         self.last_cost_max = None
         self.last_cost_mean = None
+        self.last_total_costs = None
+        self.last_oce_costs = None
+        self.last_rollout_costs = None
+        self.last_cost_components = None
+        self.last_dynamic_costs = None
+        self.last_dynamic_clearance_summary = None
+        self.last_dynamic_actor_debug = None
+        self.last_weight_summary = None
+        self.last_static_filter_all_invalid = False
+        self.last_dynamic_filter_all_invalid = False
+        self.last_oce_result = None
+        self.last_rollout_states = None
+        self.last_num_polygon_obstacles = 0
+        self.last_timing = None
 
         if self.debug:
             print(
                 f"[MPPI] Initialized samples={self.samples} c_lambda={c_lambda} u_limits={u_limits} "
-                f"u_dist_limits={u_dist_limits} method={method} L={vehicle_length} steer_rate_w={steering_rate_weight}"
+                f"u_dist_limits={u_dist_limits} method={method} L={vehicle_length} "
+                f"steer_rate_w={steering_rate_weight} dynamic_clearance_margin={dynamic_clearance_margin} "
+                f"dynamic_clearance_weight={dynamic_clearance_weight} "
+                f"static_hard_clearance_margin={static_hard_clearance_margin} "
+                f"static_clearance_margin={static_clearance_margin} "
+                f"static_clearance_weight={static_clearance_weight}"
             )
 
     def set_steering_limit(self, max_steer_rad: float):
@@ -973,7 +1952,17 @@ class MPPI:
                 print(f"[MPPI] Steering limit sync failed: {e}")
 
     def find_control(
-        self, costmap, origin, resolution, x_init, x_goal, x_nom, u_nom, obstacles, dt
+        self,
+        costmap,
+        origin,
+        resolution,
+        x_init,
+        x_goal,
+        x_nom,
+        u_nom,
+        obstacles,
+        dt,
+        oce_data=None,
     ):
         if self.mppi_context is None:
             raise RuntimeError("MPPI has no CUDA context")
@@ -981,16 +1970,31 @@ class MPPI:
         if obstacles is None:
             obstacles = []
 
+        timing_start = perf_counter()
+        timing_last = timing_start
+        timing = {}
+
+        def record_timing(name, sync_cuda=False):
+            nonlocal timing_last
+            if sync_cuda and self.debug:
+                _cuda.Context.synchronize()
+            now = perf_counter()
+            timing[name] = timing.get(name, 0.0) + (now - timing_last)
+            timing_last = now
+
         # Host-side outputs
         u_mppi_host = np.zeros_like(u_nom, dtype=np.float32)
         u_dist_host_reshaped = np.zeros(
             (self.samples, u_nom.shape[0], u_nom.shape[1]), dtype=np.float32
         )
         u_weights_host = np.zeros(self.samples, dtype=np.float32)
+        record_timing("host_output_init")
 
         costmap_gpu = None
         obstacles_gpu = np.intp(0)
         obstacle_states_gpu = np.intp(0)
+        polygon_vertices_gpu = np.intp(0)
+        polygon_offsets_gpu = np.intp(0)
         u_nom_gpu = None
         x_nom_gpu = None
         u_mppi_gpu = None
@@ -998,6 +2002,16 @@ class MPPI:
         u_dist_gpu = None
         u_weight_min_gpu = None
         u_weight_total_gpu = None
+        pre_static_weight_gpu = None
+        pre_dynamic_weight_gpu = None
+        rollout_states_gpu = None
+        combined_costs_gpu = None
+        component_costs_gpu = None
+        dynamic_costs_gpu = None
+        dynamic_actor_states_gpu = None
+        dynamic_actor_geometry_gpu = None
+        oce_cost_gpu = None
+        owned_oce_cost_gpu = None
 
         with _active_cuda_context(self.mppi_context):
             try:
@@ -1012,88 +2026,91 @@ class MPPI:
                 self.costmap_args["origin_y"] = origin[1]
                 self.costmap_args["resolution"] = resolution
                 _cuda.memcpy_htod(self.costmap_args_gpu, self.costmap_args)  # type: ignore[attr-defined]
+                record_timing("costmap_upload")
 
-                # Obstacles
-                obstacle_steps = np.int32(0)
-                num_obstacles = np.int32(len(obstacles))
+                # Nominal control & state trajectories
+                u_nom_host = np.array(u_nom, dtype=np.float32)
+                num_controls_timesteps, num_control_elements = u_nom_host.shape
+
+                (
+                    obstacle_extents_host,
+                    obstacle_states_host,
+                    dynamic_actors,
+                    polygon_vertices_host,
+                    polygon_offsets_host,
+                ) = _prepare_obstacle_batches(obstacles, num_controls_timesteps)
+                (
+                    scene_payload,
+                    oce_config,
+                    entropy_space,
+                    oce_eps,
+                    oce_discount,
+                    oce_materialize_host,
+                    oce_return_visibility_tensor,
+                    oce_scorer,
+                ) = _resolve_oce_payload(oce_data)
+                self.last_dynamic_actor_debug = _summarize_dynamic_actors(
+                    dynamic_actors,
+                    self.ego_collision_geometry,
+                )
+                record_timing("obstacle_prepare")
+
+                obstacle_steps = np.int32(1 if obstacle_states_host.shape[0] else 0)
+                num_obstacles = np.int32(int(obstacle_states_host.shape[0]))
                 if num_obstacles > 0:
-                    obstacle_sequences = []
-                    obstacle_extents = []
-                    max_steps = 0
-
-                    for obs in obstacles:
-                        if isinstance(obs, dict):
-                            states = obs.get("states")
-                            extent = obs.get("extent")
-                        else:
-                            try:
-                                states, extent = obs
-                            except (TypeError, ValueError):
-                                raise ValueError(
-                                    "Each obstacle must be a dict with 'states' and 'extent' or a (states, extent) tuple"
-                                ) from None
-
-                        if states is None or extent is None:
-                            raise ValueError(
-                                "Obstacle definitions require both states and extent information"
-                            )
-
-                        states_arr = np.asarray(states, dtype=np.float32)
-                        if states_arr.ndim != 2 or states_arr.shape[1] != 4:
-                            raise ValueError(
-                                "Obstacle states must be an array shaped (T, 4) of (x, y, v, theta)"
-                            )
-                        if states_arr.shape[0] == 0:
-                            raise ValueError(
-                                "Obstacle state sequences must include at least one timestep"
-                            )
-
-                        extent_arr = np.asarray(extent, dtype=np.float32)
-                        if extent_arr.shape != (2,):
-                            raise ValueError(
-                                "Obstacle extent must be an iterable of (dx, dy)"
-                            )
-
-                        obstacle_sequences.append(states_arr)
-                        obstacle_extents.append(extent_arr)
-                        if states_arr.shape[0] > max_steps:
-                            max_steps = states_arr.shape[0]
-
-                    obstacle_steps = np.int32(max_steps)
-
-                    padded_states = np.zeros(
-                        (int(num_obstacles), int(obstacle_steps), 4), dtype=np.float32
-                    )
-                    for idx, states_arr in enumerate(obstacle_sequences):
-                        steps = states_arr.shape[0]
-                        padded_states[idx, :steps, :] = states_arr
-                        if steps < obstacle_steps:
-                            padded_states[idx, steps:, :] = states_arr[-1]
-
-                    obstacle_states_host = padded_states.reshape(-1, 4)
-                    obstacle_extents_host = np.stack(obstacle_extents, axis=0)
-
                     obstacles_gpu = _cuda.mem_alloc(obstacle_extents_host.nbytes)  # type: ignore[attr-defined]
                     _cuda.memcpy_htod(obstacles_gpu, obstacle_extents_host)  # type: ignore[attr-defined]
 
                     obstacle_states_gpu = _cuda.mem_alloc(obstacle_states_host.nbytes)  # type: ignore[attr-defined]
                     _cuda.memcpy_htod(obstacle_states_gpu, obstacle_states_host)  # type: ignore[attr-defined]
+                record_timing("static_obstacle_upload")
 
-                # Nominal control & state trajectories
-                u_nom_host = np.array(u_nom, dtype=np.float32)
-                num_controls_timesteps, num_control_elements = u_nom_host.shape
+                num_polygon_obstacles = np.int32(
+                    max(0, polygon_offsets_host.shape[0] - 1)
+                )
+                if num_polygon_obstacles > 0:
+                    polygon_vertices_gpu = _cuda.mem_alloc(polygon_vertices_host.nbytes)  # type: ignore[attr-defined]
+                    _cuda.memcpy_htod(polygon_vertices_gpu, polygon_vertices_host)  # type: ignore[attr-defined]
+                    polygon_offsets_gpu = _cuda.mem_alloc(polygon_offsets_host.nbytes)  # type: ignore[attr-defined]
+                    _cuda.memcpy_htod(polygon_offsets_gpu, polygon_offsets_host)  # type: ignore[attr-defined]
+                record_timing("polygon_upload")
+                self.last_num_polygon_obstacles = int(num_polygon_obstacles)
+                if self.debug and self.last_num_polygon_obstacles:
+                    print(
+                        "[MPPI] static polygon obstacles="
+                        f"{self.last_num_polygon_obstacles} vertices="
+                        f"{polygon_vertices_host.shape[0] // 2}"
+                    )
+
                 u_nom_gpu = _cuda.mem_alloc(u_nom_host.nbytes)  # type: ignore[attr-defined]
                 _cuda.memcpy_htod(u_nom_gpu, u_nom_host)  # type: ignore[attr-defined]
 
                 x_nom_host = np.array(x_nom, dtype=np.float32)
                 x_nom_gpu = _cuda.mem_alloc(x_nom_host.nbytes)  # type: ignore[attr-defined]
                 _cuda.memcpy_htod(x_nom_gpu, x_nom_host)  # type: ignore[attr-defined]
+                record_timing("nominal_upload")
 
                 # Disturbance & weights buffers
                 u_weight_gpu = _cuda.mem_alloc(  # type: ignore[attr-defined]
                     int(self.samples * np.dtype(np.float32).itemsize)
                 )
                 u_dist_gpu = _cuda.mem_alloc(int(self.samples * u_nom_host.nbytes))  # type: ignore[attr-defined]
+                need_rollout_trace = (
+                    bool(dynamic_actors)
+                    or scene_payload is not None
+                    or bool(self.debug)
+                )
+                if need_rollout_trace:
+                    rollout_state_count = (
+                        int(self.samples) * int(num_controls_timesteps) * 4
+                    )
+                    rollout_states_gpu = _cuda.mem_alloc(
+                        int(rollout_state_count * np.dtype(np.float32).itemsize)
+                    )  # type: ignore[attr-defined]
+                component_costs_gpu = _cuda.mem_alloc(
+                    int(self.samples) * 5 * np.dtype(np.float32).itemsize
+                )  # type: ignore[attr-defined]
+                record_timing("rollout_buffer_alloc")
 
                 # Update optimization args for this solve
                 self.optimization_args["dt"] = np.float32(dt)
@@ -1102,19 +2119,34 @@ class MPPI:
                 )
                 self.optimization_args["num_obstacles"] = num_obstacles
                 self.optimization_args["obstacle_steps"] = obstacle_steps
+                self.optimization_args["num_polygon_obstacles"] = num_polygon_obstacles
                 self.optimization_args["x_init"] = np.array(x_init, dtype=np.float32)
                 self.optimization_args["x_goal"] = np.array(x_goal, dtype=np.float32)
                 _cuda.memcpy_htod(self.optimization_args_gpu, self.optimization_args)  # type: ignore[attr-defined]
+                record_timing("optimization_args_upload")
 
                 # Kernel handles
                 perform_rollout_func = _COMPILED_MODULE.get_function("perform_rollout")
+                add_dynamic_collision_costs_func = _COMPILED_MODULE.get_function(
+                    "add_dynamic_collision_costs"
+                )
+                add_sample_costs_func = _COMPILED_MODULE.get_function(
+                    "add_sample_costs"
+                )
                 min_weight_func = _COMPILED_MODULE.get_function("min_weight")
                 calculate_weights_func = _COMPILED_MODULE.get_function(
                     "calculate_weights"
                 )
+                filter_static_collision_weights_func = _COMPILED_MODULE.get_function(
+                    "filter_static_collision_weights"
+                )
+                filter_dynamic_collision_weights_func = _COMPILED_MODULE.get_function(
+                    "filter_dynamic_collision_weights"
+                )
                 calculate_mppi_control_func = _COMPILED_MODULE.get_function(
                     "calculate_mppi_control"
                 )
+                record_timing("kernel_lookup")
 
                 block_1d = (BLOCK_SIZE, 1, 1)
                 grid_1d_x = max(1, int((self.samples + block_1d[0] - 1) / block_1d[0]))
@@ -1129,16 +2161,141 @@ class MPPI:
                     u_nom_gpu,
                     obstacles_gpu,
                     obstacle_states_gpu,
+                    polygon_vertices_gpu,
+                    polygon_offsets_gpu,
                     self.optimization_args_gpu,
                     u_dist_gpu,
+                    (
+                        rollout_states_gpu
+                        if rollout_states_gpu is not None
+                        else np.intp(0)
+                    ),
                     u_weight_gpu,
+                    component_costs_gpu,
                     block=block_1d,
                     grid=grid_1d,
                 )
+                record_timing("rollout_kernel", sync_cuda=True)
+
+                sample_cost_bytes = int(self.samples * np.dtype(np.float32).itemsize)
+
+                if dynamic_actors:
+                    dynamic_actor_states_host, dynamic_actor_geometry_host = (
+                        _pack_dynamic_actor_arrays(dynamic_actors)
+                    )
+                    dynamic_actor_states_gpu = _cuda.mem_alloc(
+                        dynamic_actor_states_host.nbytes
+                    )  # type: ignore[attr-defined]
+                    dynamic_actor_geometry_gpu = _cuda.mem_alloc(
+                        dynamic_actor_geometry_host.nbytes
+                    )  # type: ignore[attr-defined]
+                    dynamic_costs_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
+                    _cuda.memset_d8(dynamic_costs_gpu, 0, sample_cost_bytes)  # type: ignore[attr-defined]
+                    _cuda.memcpy_htod(
+                        dynamic_actor_states_gpu, dynamic_actor_states_host
+                    )  # type: ignore[attr-defined]
+                    _cuda.memcpy_htod(
+                        dynamic_actor_geometry_gpu, dynamic_actor_geometry_host
+                    )  # type: ignore[attr-defined]
+                    record_timing("dynamic_actor_upload")
+                    add_dynamic_collision_costs_func(
+                        rollout_states_gpu,
+                        dynamic_actor_states_gpu,
+                        dynamic_actor_geometry_gpu,
+                        self.samples,
+                        np.int32(num_controls_timesteps),
+                        np.int32(dynamic_actor_geometry_host.shape[0]),
+                        np.float32(self.ego_collision_geometry[0]),
+                        np.float32(self.ego_collision_geometry[1]),
+                        np.float32(self.ego_collision_geometry[2]),
+                        np.float32(self.dynamic_collision_cost),
+                        np.float32(self.dynamic_clearance_margin),
+                        np.float32(self.dynamic_clearance_weight),
+                        dynamic_costs_gpu,
+                        u_weight_gpu,
+                        block=block_1d,
+                        grid=grid_1d,
+                    )
+                    record_timing("dynamic_cost_kernel", sync_cuda=True)
+
+                self.last_oce_result = None
+                if scene_payload is not None:
+                    if oce_scorer is None:
+                        oce_scorer = score_oce_scene_rollouts_device
+                    if oce_scorer is None:
+                        raise RuntimeError(
+                            "OCE weighting was requested, but the PyCUDA OCE evaluator "
+                            f"could not be imported: {_oce_import_error}"
+                        )
+                    if not callable(oce_scorer):
+                        raise TypeError("oce_data scorer/score_func must be callable.")
+                    oce_result = oce_scorer(
+                        scene=scene_payload,
+                        rollout_states_d=rollout_states_gpu,
+                        num_rollouts=int(self.samples),
+                        oce_config=oce_config,
+                        eps=oce_eps,
+                        entropy_space=entropy_space,
+                        discount=oce_discount,
+                        cuda_cache=_cuda_buffer_cache,
+                        materialize_host=oce_materialize_host,
+                        return_visibility_tensor=oce_return_visibility_tensor,
+                        rollout_state_stride=4,
+                        debug=bool(self.debug),
+                    )
+                    self.last_oce_result = oce_result
+                    if (
+                        hasattr(oce_result, "device_accumulation")
+                        and oce_result.device_accumulation is not None
+                    ):
+                        oce_cost_gpu = oce_result.device_accumulation.total_entropies_d
+                    else:
+                        host_costs = (
+                            oce_result
+                            if isinstance(oce_result, np.ndarray)
+                            else getattr(oce_result, "host_scores", None)
+                        )
+                        if (
+                            host_costs is None
+                            and hasattr(oce_result, "accumulation")
+                            and oce_result.accumulation is not None
+                        ):
+                            host_costs = getattr(
+                                oce_result.accumulation, "total_entropies", None
+                            )
+                        if host_costs is not None:
+                            host_costs = np.ascontiguousarray(
+                                np.asarray(host_costs, dtype=np.float32).reshape(-1)
+                            )
+                            if host_costs.shape[0] != int(self.samples):
+                                raise ValueError(
+                                    "OCE scorer host costs must have one value per sample."
+                                )
+                            owned_oce_cost_gpu = _cuda.mem_alloc(host_costs.nbytes)  # type: ignore[attr-defined]
+                            _cuda.memcpy_htod(owned_oce_cost_gpu, host_costs)  # type: ignore[attr-defined]
+                            oce_cost_gpu = owned_oce_cost_gpu
+                    if oce_cost_gpu is not None:
+                        add_sample_costs_func(
+                            u_weight_gpu,
+                            oce_cost_gpu,
+                            self.samples,
+                            block=block_1d,
+                            grid=grid_1d,
+                        )
+                    if self.debug:
+                        oce_queries = getattr(oce_result, "num_unique_queries", 0)
+                        print(
+                            f"[MPPI] OCE entropy_space={entropy_space} device evaluations={oce_queries}"
+                        )
+                    record_timing("oce_scoring", sync_cuda=True)
+
+                combined_costs_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
+                _cuda.memcpy_dtod(combined_costs_gpu, u_weight_gpu, sample_cost_bytes)  # type: ignore[attr-defined]
 
                 # Capture raw costs before weight transform
                 raw_costs_host = np.zeros(self.samples, dtype=np.float32)
-                _cuda.memcpy_dtoh(raw_costs_host, u_weight_gpu)  # type: ignore[attr-defined]
+                _cuda.memcpy_dtoh(raw_costs_host, combined_costs_gpu)  # type: ignore[attr-defined]
+                record_timing("raw_cost_snapshot")
 
                 # Find min cost
                 u_weight_min_gpu = _cuda.mem_alloc(np.dtype(np.float32).itemsize)  # type: ignore[attr-defined]
@@ -1152,6 +2309,7 @@ class MPPI:
                     grid=(1, 1, 1),
                     shared=BLOCK_SIZE * np.dtype(np.float32).itemsize,
                 )
+                record_timing("min_weight_kernel", sync_cuda=True)
 
                 # Convert to weights
                 u_weight_total_gpu = _cuda.mem_alloc(np.dtype(np.float32).itemsize)  # type: ignore[attr-defined]
@@ -1165,6 +2323,90 @@ class MPPI:
                     block=block_1d,
                     grid=grid_1d,
                 )
+                record_timing("calculate_weights_kernel", sync_cuda=True)
+                self.last_static_filter_all_invalid = False
+                self.last_dynamic_filter_all_invalid = False
+                if num_polygon_obstacles > 0:
+                    pre_static_weight_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
+                    _cuda.memcpy_dtod(
+                        pre_static_weight_gpu, u_weight_gpu, sample_cost_bytes
+                    )  # type: ignore[attr-defined]
+                    _cuda.memset_d8(
+                        u_weight_total_gpu, 0, np.dtype(np.float32).itemsize
+                    )  # type: ignore[attr-defined]
+                    filter_static_collision_weights_func(
+                        self.samples,
+                        u_weight_gpu,
+                        component_costs_gpu,
+                        np.float32(0.5 * self.static_collision_cost),
+                        u_weight_total_gpu,
+                        block=block_1d,
+                        grid=grid_1d,
+                    )
+                    record_timing("static_weight_filter_kernel", sync_cuda=True)
+                    static_weight_total = np.zeros(1, dtype=np.float32)
+                    _cuda.memcpy_dtoh(static_weight_total, u_weight_total_gpu)  # type: ignore[attr-defined]
+                    record_timing("static_weight_total_download")
+                    if float(static_weight_total[0]) <= 0.0:
+                        pre_static_weights_host = np.zeros(
+                            self.samples, dtype=np.float32
+                        )
+                        _cuda.memcpy_dtoh(
+                            pre_static_weights_host, pre_static_weight_gpu
+                        )  # type: ignore[attr-defined]
+                        restored_total = np.array(
+                            [np.sum(pre_static_weights_host, dtype=np.float32)],
+                            dtype=np.float32,
+                        )
+                        if float(restored_total[0]) > 0.0:
+                            _cuda.memcpy_dtod(
+                                u_weight_gpu,
+                                pre_static_weight_gpu,
+                                sample_cost_bytes,
+                            )  # type: ignore[attr-defined]
+                            _cuda.memcpy_htod(
+                                u_weight_total_gpu, restored_total
+                            )  # type: ignore[attr-defined]
+                            self.last_static_filter_all_invalid = True
+                        record_timing("static_weight_filter_restore")
+                if dynamic_costs_gpu is not None:
+                    pre_dynamic_weight_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
+                    _cuda.memcpy_dtod(
+                        pre_dynamic_weight_gpu, u_weight_gpu, sample_cost_bytes
+                    )  # type: ignore[attr-defined]
+                    pre_dynamic_weight_total = np.zeros(1, dtype=np.float32)
+                    _cuda.memcpy_dtoh(pre_dynamic_weight_total, u_weight_total_gpu)  # type: ignore[attr-defined]
+                    _cuda.memset_d8(
+                        u_weight_total_gpu, 0, np.dtype(np.float32).itemsize
+                    )  # type: ignore[attr-defined]
+                    filter_dynamic_collision_weights_func(
+                        self.samples,
+                        u_weight_gpu,
+                        dynamic_costs_gpu,
+                        np.float32(0.5 * self.dynamic_collision_cost),
+                        u_weight_total_gpu,
+                        block=block_1d,
+                        grid=grid_1d,
+                    )
+                    record_timing("dynamic_weight_filter_kernel", sync_cuda=True)
+                    dynamic_weight_total = np.zeros(1, dtype=np.float32)
+                    _cuda.memcpy_dtoh(dynamic_weight_total, u_weight_total_gpu)  # type: ignore[attr-defined]
+                    record_timing("dynamic_weight_total_download")
+                    if (
+                        float(dynamic_weight_total[0]) <= 0.0
+                        and float(pre_dynamic_weight_total[0]) > 0.0
+                    ):
+                        _cuda.memcpy_dtod(
+                            u_weight_gpu,
+                            pre_dynamic_weight_gpu,
+                            sample_cost_bytes,
+                        )  # type: ignore[attr-defined]
+                        _cuda.memcpy_htod(
+                            u_weight_total_gpu,
+                            pre_dynamic_weight_total,
+                        )  # type: ignore[attr-defined]
+                        self.last_dynamic_filter_all_invalid = True
+                        record_timing("dynamic_weight_filter_restore")
 
                 # Accumulate weighted disturbances in unconstrained control space.
                 # This avoids biasing saturated steering commands back toward zero.
@@ -1186,6 +2428,7 @@ class MPPI:
 
                 u_mppi_gpu = _cuda.mem_alloc(u_nom_host.nbytes)  # type: ignore[attr-defined]
                 _cuda.memcpy_htod(u_mppi_gpu, u_nom_z_host)  # type: ignore[attr-defined]
+                record_timing("control_prep_upload")
                 calculate_mppi_control_func(
                     self.samples,
                     u_nom_gpu,
@@ -1198,11 +2441,13 @@ class MPPI:
                     block=block_1d,
                     grid=grid_1d,
                 )
+                record_timing("control_kernel", sync_cuda=True)
 
                 # Copy back
                 _cuda.memcpy_dtoh(u_mppi_host, u_mppi_gpu)  # type: ignore[attr-defined]
                 u_mppi_host[:, 0] = u_limits_host[0] * np.tanh(u_mppi_host[:, 0])
                 u_mppi_host[:, 1] = u_limits_host[1] * np.tanh(u_mppi_host[:, 1])
+                record_timing("control_download")
 
                 u_dist_raw_host = np.zeros(
                     self.samples * num_controls_timesteps * num_control_elements,
@@ -1212,21 +2457,99 @@ class MPPI:
                 u_dist_host_reshaped = u_dist_raw_host.reshape(
                     (self.samples, num_controls_timesteps, num_control_elements)
                 )
+                record_timing("disturbance_download")
                 _cuda.memcpy_dtoh(u_weights_host, u_weight_gpu)  # type: ignore[attr-defined]
+                record_timing("weights_download")
+                if rollout_states_gpu is not None:
+                    rollout_states_host = np.zeros(
+                        (self.samples, num_controls_timesteps, 4), dtype=np.float32
+                    )
+                    _cuda.memcpy_dtoh(rollout_states_host, rollout_states_gpu)  # type: ignore[attr-defined]
+                    self.last_rollout_states = rollout_states_host
+                else:
+                    self.last_rollout_states = None
+                record_timing("rollout_states_download")
+                combined_costs_host = np.zeros(self.samples, dtype=np.float32)
+                _cuda.memcpy_dtoh(combined_costs_host, combined_costs_gpu)  # type: ignore[attr-defined]
+                oce_costs_host = np.zeros(self.samples, dtype=np.float32)
+                if oce_cost_gpu is not None:
+                    _cuda.memcpy_dtoh(oce_costs_host, oce_cost_gpu)  # type: ignore[attr-defined]
+                component_costs_host = np.zeros(
+                    (int(self.samples), 5), dtype=np.float32
+                )
+                if component_costs_gpu is not None:
+                    _cuda.memcpy_dtoh(component_costs_host, component_costs_gpu)  # type: ignore[attr-defined]
+                dynamic_costs_host = np.zeros(self.samples, dtype=np.float32)
+                if dynamic_costs_gpu is not None:
+                    _cuda.memcpy_dtoh(dynamic_costs_host, dynamic_costs_gpu)  # type: ignore[attr-defined]
+                    component_costs_host[:, 4] = dynamic_costs_host
+                record_timing("cost_components_download")
 
                 # Diagnostics
                 weight_sum = float(np.sum(u_weights_host) + 1e-12)
                 ess = (weight_sum**2) / (float(np.sum(u_weights_host**2)) + 1e-12)
                 self.last_ess = ess
-                if raw_costs_host.size:
-                    self.last_cost_min = float(np.min(raw_costs_host))
-                    self.last_cost_max = float(np.max(raw_costs_host))
-                    self.last_cost_mean = float(np.mean(raw_costs_host))
-                if self.debug:
-                    pct = (ess / self.samples) * 100.0
-                    print(
-                        f"[MPPI] dt={dt:.3f} cost(min/mean/max)=({self.last_cost_min:.2f}/{self.last_cost_mean:.2f}/{self.last_cost_max:.2f}) ESS={ess:.1f}/{self.samples} ({pct:.1f}%)"
-                    )
+                self.last_total_costs = combined_costs_host
+                self.last_oce_costs = oce_costs_host
+                self.last_rollout_costs = combined_costs_host - oce_costs_host
+                self.last_dynamic_costs = dynamic_costs_host
+                self.last_cost_components = {
+                    "state": component_costs_host[:, 0],
+                    "control": component_costs_host[:, 1],
+                    "static_obstacle": component_costs_host[:, 2],
+                    "visibility": component_costs_host[:, 3],
+                    "dynamic_obstacle": component_costs_host[:, 4],
+                    "oce": oce_costs_host,
+                }
+                self.last_dynamic_clearance_summary = None
+                # if (
+                #     self.dynamic_clearance_diagnostics
+                #     and dynamic_actors
+                #     and self.last_rollout_states is not None
+                # ):
+                #     self.last_dynamic_clearance_summary = (
+                #         _dynamic_rollout_clearance_summary(
+                #             self.last_rollout_states,
+                #             dynamic_actor_states_host,
+                #             dynamic_actor_geometry_host,
+                #             self.ego_collision_geometry,
+                #         )
+                #     )
+                # self.last_weight_summary = _summarize_weights_and_costs(
+                #     weights=u_weights_host,
+                #     total_costs=combined_costs_host,
+                #     dynamic_costs=dynamic_costs_host,
+                #     samples=int(self.samples),
+                #     dynamic_collision_cost=self.dynamic_collision_cost,
+                # )
+                # self.last_weight_summary["static_filter_all_invalid"] = bool(
+                #     self.last_static_filter_all_invalid
+                # )
+                # self.last_weight_summary["dynamic_filter_all_invalid"] = bool(
+                #     self.last_dynamic_filter_all_invalid
+                # )
+                # if combined_costs_host.size:
+                #     self.last_cost_min = float(np.min(combined_costs_host))
+                #     self.last_cost_max = float(np.max(combined_costs_host))
+                #     self.last_cost_mean = float(np.mean(combined_costs_host))
+                # if self.debug:
+                #     pct = (ess / self.samples) * 100.0
+                #     print(
+                #         f"[MPPI] dt={dt:.3f} cost(min/mean/max)=({self.last_cost_min:.2f}/{self.last_cost_mean:.2f}/{self.last_cost_max:.2f}) ESS={ess:.1f}/{self.samples} ({pct:.1f}%)"
+                #     )
+                #     component_means = {
+                #         key: float(np.mean(value)) if np.size(value) else 0.0
+                #         for key, value in self.last_cost_components.items()
+                #     }
+                #     print(f"[MPPI] cost components mean={component_means}")
+                #     print(f"[MPPI] dynamic actors={self.last_dynamic_actor_debug}")
+                #     print(f"[MPPI] weight summary={self.last_weight_summary}")
+                #     if self.last_dynamic_clearance_summary is not None:
+                #         print(
+                #             "[MPPI] dynamic clearance "
+                #             f"{self.last_dynamic_clearance_summary}"
+                #         )
+                # record_timing("diagnostics")
 
                 # Clamp final control outputs within limits
                 u_mppi_host[:, 0] = np.clip(
@@ -1250,11 +2573,30 @@ class MPPI:
                         if not isinstance(obstacle_states_gpu, int)
                         else None
                     ),
+                    (
+                        polygon_vertices_gpu
+                        if not isinstance(polygon_vertices_gpu, int)
+                        else None
+                    ),
+                    (
+                        polygon_offsets_gpu
+                        if not isinstance(polygon_offsets_gpu, int)
+                        else None
+                    ),
                     u_nom_gpu,
                     x_nom_gpu,
                     u_mppi_gpu,
                     u_weight_gpu,
                     u_dist_gpu,
+                    rollout_states_gpu,
+                    combined_costs_gpu,
+                    component_costs_gpu,
+                    pre_static_weight_gpu,
+                    pre_dynamic_weight_gpu,
+                    dynamic_costs_gpu,
+                    dynamic_actor_states_gpu,
+                    dynamic_actor_geometry_gpu,
+                    owned_oce_cost_gpu,
                     u_weight_min_gpu,
                     u_weight_total_gpu,
                 ]:
@@ -1263,5 +2605,28 @@ class MPPI:
                             buf.free()
                     except Exception:
                         pass
+                record_timing("cleanup")
 
+        timing["total"] = perf_counter() - timing_start
+        self.last_timing = dict(timing)
+        if self.debug or timing["total"] > 1.0:
+            timing_parts = " ".join(
+                f"{name}={elapsed * 1000.0:.2f}ms"
+                for name, elapsed in timing.items()
+                if name != "total"
+            )
+            print(
+                "[MPPI timing] "
+                f"total={timing['total'] * 1000.0:.2f}ms "
+                f"sync_cuda={bool(self.debug)} "
+                f"samples={int(self.samples)} horizon={int(u_nom.shape[0])} "
+                f"obstacles={len(obstacles)} "
+                f"{timing_parts}"
+            )
+            if self.last_dynamic_actor_debug:
+                print(f"[MPPI dynamic actors] {self.last_dynamic_actor_debug}")
+            if self.last_weight_summary:
+                print(f"[MPPI weight summary] {self.last_weight_summary}")
+            if self.last_dynamic_clearance_summary:
+                print(f"[MPPI dynamic clearance] {self.last_dynamic_clearance_summary}")
         return u_mppi_host, u_dist_host_reshaped, u_weights_host
