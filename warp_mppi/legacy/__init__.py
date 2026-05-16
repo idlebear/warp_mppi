@@ -15,10 +15,20 @@ try:
 except ImportError:
     evaluate_trajectories_by_entropy_gpu = None
 
-from .discrete_oce_pycuda import evaluate_discrete_oce_gpu
+from .discrete_oce_pycuda import (
+    DISCRETE_OCE_SCORING_MODES,
+    evaluate_discrete_oce_gpu,
+    evaluate_discrete_oce_rollouts_gpu,
+    normalize_discrete_oce_scoring_mode,
+    score_discrete_oce_components,
+)
 
 __all__ = [
     "PyCudaMPPI",
     "evaluate_trajectories_by_entropy_gpu",
     "evaluate_discrete_oce_gpu",
+    "evaluate_discrete_oce_rollouts_gpu",
+    "DISCRETE_OCE_SCORING_MODES",
+    "normalize_discrete_oce_scoring_mode",
+    "score_discrete_oce_components",
 ]

@@ -19,6 +19,11 @@ try:
 except Exception as _oce_import_error:  # pragma: no cover - optional OCE path
     score_oce_scene_rollouts_device = None
 
+try:
+    from .discrete_oce_pycuda import evaluate_discrete_oce_rollouts_gpu
+except Exception as _discrete_oce_import_error:  # pragma: no cover - optional OCE path
+    evaluate_discrete_oce_rollouts_gpu = None
+
 
 _cuda: Any = cuda  # alias to satisfy static analyzers
 
@@ -309,6 +314,98 @@ def _pack_dynamic_actor_arrays(dynamic_actors):
     return actor_states, actor_collision_geometry
 
 
+def _prepare_occupancy_grid_stack(occupancy_grids):
+    if occupancy_grids is None or occupancy_grids is False:
+        return None
+    if isinstance(occupancy_grids, dict):
+        grids = occupancy_grids.get(
+            "probability_grids",
+            occupancy_grids.get("grids", occupancy_grids.get("occupancy")),
+        )
+        origin = occupancy_grids.get("origin", (0.0, 0.0))
+        resolution = occupancy_grids.get("resolution", 1.0)
+        hard_threshold = occupancy_grids.get("planning_hard_threshold", 0.65)
+        soft_weight = occupancy_grids.get("mppi_occupancy_weight")
+    else:
+        grids = getattr(occupancy_grids, "probability_grids", None)
+        origin = getattr(occupancy_grids, "origin", (0.0, 0.0))
+        resolution = getattr(occupancy_grids, "resolution", 1.0)
+        hard_threshold = getattr(occupancy_grids, "planning_hard_threshold", 0.65)
+        soft_weight = getattr(occupancy_grids, "mppi_occupancy_weight", None)
+
+    if grids is None:
+        return None
+    grids = np.asarray(grids, dtype=np.float32)
+    if grids.ndim == 2:
+        grids = grids[np.newaxis, ...]
+    if grids.ndim != 3 or grids.shape[0] <= 0:
+        raise ValueError(
+            "occupancy probability grids must have shape (steps, rows, cols)"
+        )
+    grids = np.ascontiguousarray(np.clip(grids, 0.0, 1.0), dtype=np.float32)
+    return {
+        "grids": grids,
+        "origin": (float(origin[0]), float(origin[1])),
+        "resolution": float(resolution),
+        "hard_threshold": float(hard_threshold),
+        "soft_weight": None if soft_weight is None else float(soft_weight),
+    }
+
+
+def _prepare_rollout_obstacle_batches(obstacles, horizon, occupancy_payload=None):
+    if occupancy_payload is not None:
+        return (
+            np.zeros((0, 2), dtype=np.float32),
+            np.zeros((0, 4), dtype=np.float32),
+            [],
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((1,), dtype=np.int32),
+        )
+    return _prepare_obstacle_batches(obstacles, horizon)
+
+
+def occupancy_grid_cost_for_state(
+    state,
+    probability_grids,
+    *,
+    origin,
+    resolution,
+    step=0,
+    ego_collision_geometry=(0.0, 0.0, 0.0),
+    soft_weight=1.0,
+    collision_cost=float(LARGE_COLLISION_COST),
+    hard_threshold=0.65,
+):
+    grids = np.asarray(probability_grids, dtype=np.float32)
+    if grids.ndim == 2:
+        grids = grids[np.newaxis, ...]
+    step = int(np.clip(step, 0, grids.shape[0] - 1))
+    grid = grids[step]
+    state = np.asarray(state, dtype=np.float32).reshape(-1)
+    radius, offset_x, offset_y = np.asarray(
+        ego_collision_geometry, dtype=np.float32
+    ).reshape(3)
+    centers = _circle_centers_from_pose(
+        state[0],
+        state[1],
+        state[3] if state.size > 3 else 0.0,
+        offset_x,
+        offset_y,
+    )
+    max_probability = 0.0
+    rows, cols = grid.shape
+    for center in centers:
+        col = int(np.floor((float(center[0]) - float(origin[0])) / float(resolution)))
+        row = int(np.floor((float(center[1]) - float(origin[1])) / float(resolution)))
+        if row < 0 or row >= rows or col < 0 or col >= cols:
+            return float(collision_cost)
+        max_probability = max(max_probability, float(grid[row, col]))
+    cost = float(soft_weight) * max_probability
+    if max_probability >= float(hard_threshold):
+        cost += float(collision_cost)
+    return cost
+
+
 def _resolve_oce_payload(oce_data):
     if oce_data is None or oce_data is False:
         return None, None, "kde", 1.0e-9, 1.0, False, False, None
@@ -341,6 +438,222 @@ def _resolve_oce_payload(oce_data):
             scorer,
         )
     return oce_data, None, "kde", 1.0e-9, 1.0, False, False, None
+
+
+def _resolve_discrete_oce_payload(oce_data):
+    if not isinstance(oce_data, dict) or not bool(oce_data.get("enabled", True)):
+        return None
+    oce_type = str(
+        oce_data.get("type", oce_data.get("kind", oce_data.get("mode", "")))
+    ).lower()
+    if oce_type == "discrete" or "tracker" in oce_data:
+        return oce_data
+    return None
+
+
+def _compact_csr_state_space(
+    *,
+    state_centers,
+    beliefs,
+    prefix_beliefs,
+    transition_data,
+    transition_indices,
+    transition_indptr,
+    max_states=None,
+    probability_floor=0.0,
+):
+    """Reduce discrete OCE to high-probability states before rollout scoring.
+
+    The full transition grid can be thousands of states.  MPPI rollout scoring
+    only needs a relative OCE cost, so we keep the states that are plausible
+    over the evaluated horizon and renormalize the induced transition rows.
+    """
+    max_states = None if max_states is None else int(max_states)
+    probability_floor = float(probability_floor or 0.0)
+    num_states = int(np.asarray(state_centers).shape[0])
+    if max_states is not None and max_states <= 0:
+        max_states = None
+    if (max_states is None or max_states >= num_states) and probability_floor <= 0.0:
+        return {
+            "state_centers": state_centers,
+            "beliefs": beliefs,
+            "prefix_beliefs": prefix_beliefs,
+            "transition_data": transition_data,
+            "transition_indices": transition_indices,
+            "transition_indptr": transition_indptr,
+            "state_indices": np.arange(num_states, dtype=np.int32),
+            "reduced": False,
+        }
+
+    prefix = np.asarray(prefix_beliefs, dtype=np.float32)
+    scores = np.max(prefix, axis=(0, 1))
+    if probability_floor > 0.0:
+        selected = np.flatnonzero(scores >= probability_floor)
+    else:
+        selected = np.arange(num_states, dtype=np.int64)
+    if selected.size == 0:
+        selected = np.asarray([int(np.argmax(scores))], dtype=np.int64)
+    if max_states is not None and selected.size > max_states:
+        selected = np.argsort(scores)[-max_states:]
+    selected = np.asarray(np.unique(selected), dtype=np.int64)
+    selected.sort()
+
+    old_to_new = np.full((num_states,), -1, dtype=np.int32)
+    old_to_new[selected] = np.arange(selected.size, dtype=np.int32)
+    num_agents = int(np.asarray(beliefs).shape[0])
+
+    data_chunks = []
+    index_chunks = []
+    new_indptr = np.empty((num_agents, selected.size + 1), dtype=np.int32)
+    offset = 0
+    transition_data = np.asarray(transition_data, dtype=np.float32)
+    transition_indices = np.asarray(transition_indices, dtype=np.int32)
+    transition_indptr = np.asarray(transition_indptr, dtype=np.int32)
+
+    for agent_idx in range(num_agents):
+        new_indptr[agent_idx, 0] = offset
+        for new_row, old_row in enumerate(selected):
+            start = int(transition_indptr[agent_idx, old_row])
+            end = int(transition_indptr[agent_idx, old_row + 1])
+            row_cols = transition_indices[start:end]
+            row_data = transition_data[start:end]
+            keep_mask = old_to_new[row_cols] >= 0
+            cols = old_to_new[row_cols[keep_mask]].astype(np.int32, copy=False)
+            vals = row_data[keep_mask].astype(np.float32, copy=True)
+            row_sum = float(vals.sum())
+            if row_sum > 1.0e-12:
+                vals /= row_sum
+            else:
+                cols = np.asarray([new_row], dtype=np.int32)
+                vals = np.asarray([1.0], dtype=np.float32)
+            data_chunks.append(vals)
+            index_chunks.append(cols)
+            offset += int(vals.size)
+            new_indptr[agent_idx, new_row + 1] = offset
+
+    if data_chunks:
+        new_data = np.concatenate(data_chunks).astype(np.float32, copy=False)
+        new_indices = np.concatenate(index_chunks).astype(np.int32, copy=False)
+    else:
+        new_data = np.zeros((0,), dtype=np.float32)
+        new_indices = np.zeros((0,), dtype=np.int32)
+
+    new_beliefs = np.ascontiguousarray(
+        np.asarray(beliefs)[:, selected], dtype=np.float32
+    )
+    belief_sums = new_beliefs.sum(axis=1, keepdims=True)
+    np.divide(new_beliefs, belief_sums, out=new_beliefs, where=belief_sums > 1.0e-12)
+
+    new_prefix = np.ascontiguousarray(prefix[:, :, selected], dtype=np.float32)
+    prefix_sums = new_prefix.sum(axis=2, keepdims=True)
+    np.divide(new_prefix, prefix_sums, out=new_prefix, where=prefix_sums > 1.0e-12)
+
+    return {
+        "state_centers": np.ascontiguousarray(
+            np.asarray(state_centers, dtype=np.float32)[selected]
+        ),
+        "beliefs": new_beliefs,
+        "prefix_beliefs": new_prefix,
+        "transition_data": new_data,
+        "transition_indices": new_indices,
+        "transition_indptr": new_indptr,
+        "state_indices": selected.astype(np.int32, copy=False),
+        "reduced": selected.size != num_states,
+    }
+
+
+def _prepare_discrete_oce_rollout_inputs(oce_payload, horizon):
+    tracker = oce_payload.get("tracker")
+    if tracker is None:
+        raise ValueError("discrete oce_data requires a tracker")
+    if not getattr(tracker, "agent_hmms", None):
+        return None
+
+    eval_horizon = max(1, int(oce_payload.get("horizon", horizon)))
+    agent_ids, beliefs = tracker.agent_belief_matrix()
+    if len(agent_ids) == 0:
+        return None
+
+    (
+        transition_data,
+        transition_indices,
+        transition_indptr,
+        prefix_beliefs,
+    ) = tracker.agent_mixed_transition_csr(agent_ids, eval_horizon)
+    state_centers = np.asarray(tracker.state_centers_sim, dtype=np.float32)
+    max_states = oce_payload.get("max_states", oce_payload.get("state_limit", 384))
+    if max_states is not None and int(max_states) <= 0:
+        max_states = None
+        probability_floor = 0.0
+    else:
+        probability_floor = float(oce_payload.get("state_probability_floor", 1.0e-4))
+    compacted = _compact_csr_state_space(
+        state_centers=state_centers,
+        beliefs=np.asarray(beliefs, dtype=np.float32),
+        prefix_beliefs=np.asarray(prefix_beliefs, dtype=np.float32),
+        transition_data=np.asarray(transition_data, dtype=np.float32),
+        transition_indices=np.asarray(transition_indices, dtype=np.int32),
+        transition_indptr=np.asarray(transition_indptr, dtype=np.int32),
+        max_states=max_states,
+        probability_floor=probability_floor,
+    )
+
+    occupancy_horizon = oce_payload.get("occupancy_horizon")
+    agent_owner_bits = np.zeros((len(agent_ids),), dtype=np.uint64)
+    if occupancy_horizon is not None:
+        for idx, agent_id in enumerate(agent_ids):
+            bit_index = getattr(occupancy_horizon, "agent_bit_indices", {}).get(
+                agent_id
+            )
+            if bit_index is not None:
+                agent_owner_bits[idx] = np.uint64(1) << np.uint64(bit_index)
+        static_grid = np.zeros(
+            occupancy_horizon.probability_grids.shape[1:],
+            dtype=np.uint8,
+        )
+        grid_origin = occupancy_horizon.origin
+        grid_resolution = occupancy_horizon.resolution
+        occupancy_probability_grids = occupancy_horizon.probability_grids
+        occupancy_owner_mask_grids = occupancy_horizon.owner_mask_grids
+        occupancy_threshold = getattr(occupancy_horizon, "visibility_threshold", 0.25)
+    else:
+        static_grid = tracker.static_occupancy_grid
+        grid_origin = (
+            float(tracker.bounds["min_x"]),
+            float(tracker.bounds["min_y"]),
+        )
+        grid_resolution = tracker.cell_size
+        occupancy_probability_grids = None
+        occupancy_owner_mask_grids = None
+        occupancy_threshold = float(oce_payload.get("occupancy_threshold", 0.25))
+
+    return {
+        "agent_ids": agent_ids,
+        "beliefs": compacted["beliefs"],
+        "state_centers": compacted["state_centers"],
+        "static_grid": np.asarray(static_grid, dtype=np.uint8),
+        "grid_origin": (float(grid_origin[0]), float(grid_origin[1])),
+        "grid_resolution": float(grid_resolution),
+        "transition_data": compacted["transition_data"],
+        "transition_indices": compacted["transition_indices"],
+        "transition_indptr": compacted["transition_indptr"],
+        "prefix_beliefs": compacted["prefix_beliefs"],
+        "horizon": eval_horizon,
+        "scan_range": float(oce_payload.get("scan_range", np.inf)),
+        "return_visibility": bool(oce_payload.get("return_visibility_tensor", False)),
+        "occupancy_probability_grids": occupancy_probability_grids,
+        "occupancy_owner_mask_grids": occupancy_owner_mask_grids,
+        "agent_owner_bits": agent_owner_bits,
+        "occupancy_threshold": float(occupancy_threshold),
+        "state_indices": compacted["state_indices"],
+        "state_reduction": {
+            "enabled": bool(compacted["reduced"]),
+            "original_states": int(state_centers.shape[0]),
+            "selected_states": int(compacted["state_centers"].shape[0]),
+            "max_states": None if max_states is None else int(max_states),
+            "probability_floor": float(probability_floor),
+        },
+    }
 
 
 def _circle_centers_from_pose(x, y, theta, offset_x, offset_y):
@@ -1479,6 +1792,84 @@ _MPPI_CUDA_SOURCE = """
     }
 
     extern "C" __global__
+    void add_occupancy_grid_costs(
+            const State *rollout_states,
+            const float *occupancy_grids,
+            int samples,
+            int num_controls,
+            int occupancy_steps,
+            int rows,
+            int cols,
+            float origin_x,
+            float origin_y,
+            float resolution,
+            float ego_circle_radius,
+            float ego_circle_offset_x,
+            float ego_circle_offset_y,
+            float collision_penalty,
+            float soft_weight,
+            float hard_threshold,
+            float *occupancy_costs,
+            float *sample_costs
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            float occupancy_cost = 0.0f;
+            bool collided = false;
+
+            for (int step_idx = 0; step_idx < num_controls; ++step_idx) {
+                int grid_step = step_idx;
+                if (grid_step < 0) {
+                    grid_step = 0;
+                }
+                if (grid_step >= occupancy_steps) {
+                    grid_step = occupancy_steps - 1;
+                }
+                const State ego_state = rollout_states[sample_index * num_controls + step_idx];
+                float max_probability = 0.0f;
+                for (int circle_idx = 0; circle_idx < 3; ++circle_idx) {
+                    float cx;
+                    float cy;
+                    circle_center_from_pose(
+                        ego_state.x,
+                        ego_state.y,
+                        ego_state.theta,
+                        ego_circle_offset_x,
+                        ego_circle_offset_y,
+                        circle_idx,
+                        &cx,
+                        &cy
+                    );
+                    int col = epsilon_round((cx - origin_x) / resolution);
+                    int row = epsilon_round((cy - origin_y) / resolution);
+                    if (row < 0 || row >= rows || col < 0 || col >= cols) {
+                        collided = true;
+                        max_probability = 1.0f;
+                        continue;
+                    }
+                    float probability = occupancy_grids[(grid_step * rows + row) * cols + col];
+                    if (probability > max_probability) {
+                        max_probability = probability;
+                    }
+                }
+                occupancy_cost += soft_weight * max_probability;
+                if (max_probability >= hard_threshold) {
+                    collided = true;
+                }
+            }
+
+            if (collided) {
+                occupancy_cost += collision_penalty;
+            }
+            sample_costs[sample_index] += occupancy_cost;
+            if (occupancy_costs != NULL) {
+                occupancy_costs[sample_index] = occupancy_cost;
+            }
+        }
+    }
+
+    extern "C" __global__
     void add_sample_costs(
             float *sample_costs,
             const float *extra_costs,
@@ -1811,6 +2202,7 @@ class MPPI:
         static_clearance_weight=0.0,
         static_collision_cost=float(LARGE_COLLISION_COST),
         static_hard_clearance_margin=0.0,
+        mppi_occupancy_weight=None,
     ):
         """Initialize MPPI controller.
 
@@ -1832,6 +2224,11 @@ class MPPI:
         self.static_clearance_weight = float(static_clearance_weight)
         self.static_collision_cost = float(static_collision_cost)
         self.static_hard_clearance_margin = float(static_hard_clearance_margin)
+        self.mppi_occupancy_weight = (
+            float(dynamic_clearance_weight)
+            if mppi_occupancy_weight is None
+            else float(mppi_occupancy_weight)
+        )
         self.dynamic_clearance_diagnostics = bool(debug)
         self.ego_collision_geometry = _actor_collision_geometry_from_extent(
             (self.vehicle_length / 2.0, self.vehicle_width / 2.0)
@@ -1963,6 +2360,7 @@ class MPPI:
         obstacles,
         dt,
         oce_data=None,
+        occupancy_grids=None,
     ):
         if self.mppi_context is None:
             raise RuntimeError("MPPI has no CUDA context")
@@ -2010,6 +2408,8 @@ class MPPI:
         dynamic_costs_gpu = None
         dynamic_actor_states_gpu = None
         dynamic_actor_geometry_gpu = None
+        occupancy_grids_gpu = None
+        occupancy_costs_gpu = None
         oce_cost_gpu = None
         owned_oce_cost_gpu = None
 
@@ -2031,6 +2431,8 @@ class MPPI:
                 # Nominal control & state trajectories
                 u_nom_host = np.array(u_nom, dtype=np.float32)
                 num_controls_timesteps, num_control_elements = u_nom_host.shape
+                occupancy_payload = _prepare_occupancy_grid_stack(occupancy_grids)
+                discrete_oce_payload = _resolve_discrete_oce_payload(oce_data)
 
                 (
                     obstacle_extents_host,
@@ -2038,17 +2440,31 @@ class MPPI:
                     dynamic_actors,
                     polygon_vertices_host,
                     polygon_offsets_host,
-                ) = _prepare_obstacle_batches(obstacles, num_controls_timesteps)
-                (
-                    scene_payload,
-                    oce_config,
-                    entropy_space,
-                    oce_eps,
-                    oce_discount,
-                    oce_materialize_host,
-                    oce_return_visibility_tensor,
-                    oce_scorer,
-                ) = _resolve_oce_payload(oce_data)
+                ) = _prepare_rollout_obstacle_batches(
+                    obstacles, num_controls_timesteps, occupancy_payload
+                )
+                if discrete_oce_payload is None:
+                    (
+                        scene_payload,
+                        oce_config,
+                        entropy_space,
+                        oce_eps,
+                        oce_discount,
+                        oce_materialize_host,
+                        oce_return_visibility_tensor,
+                        oce_scorer,
+                    ) = _resolve_oce_payload(oce_data)
+                else:
+                    scene_payload = None
+                    oce_config = None
+                    entropy_space = "discrete"
+                    oce_eps = 1.0e-9
+                    oce_discount = 1.0
+                    oce_materialize_host = False
+                    oce_return_visibility_tensor = bool(
+                        discrete_oce_payload.get("return_visibility_tensor", False)
+                    )
+                    oce_scorer = None
                 self.last_dynamic_actor_debug = _summarize_dynamic_actors(
                     dynamic_actors,
                     self.ego_collision_geometry,
@@ -2075,6 +2491,11 @@ class MPPI:
                     _cuda.memcpy_htod(polygon_offsets_gpu, polygon_offsets_host)  # type: ignore[attr-defined]
                 record_timing("polygon_upload")
                 self.last_num_polygon_obstacles = int(num_polygon_obstacles)
+                if self.debug and occupancy_payload is not None:
+                    print(
+                        "[MPPI] using occupancy grid obstacle costs; "
+                        "legacy obstacle geometry disabled"
+                    )
                 if self.debug and self.last_num_polygon_obstacles:
                     print(
                         "[MPPI] static polygon obstacles="
@@ -2098,6 +2519,8 @@ class MPPI:
                 need_rollout_trace = (
                     bool(dynamic_actors)
                     or scene_payload is not None
+                    or discrete_oce_payload is not None
+                    or occupancy_payload is not None
                     or bool(self.debug)
                 )
                 if need_rollout_trace:
@@ -2129,6 +2552,9 @@ class MPPI:
                 perform_rollout_func = _COMPILED_MODULE.get_function("perform_rollout")
                 add_dynamic_collision_costs_func = _COMPILED_MODULE.get_function(
                     "add_dynamic_collision_costs"
+                )
+                add_occupancy_grid_costs_func = _COMPILED_MODULE.get_function(
+                    "add_occupancy_grid_costs"
                 )
                 add_sample_costs_func = _COMPILED_MODULE.get_function(
                     "add_sample_costs"
@@ -2218,76 +2644,188 @@ class MPPI:
                     )
                     record_timing("dynamic_cost_kernel", sync_cuda=True)
 
-                self.last_oce_result = None
-                if scene_payload is not None:
-                    if oce_scorer is None:
-                        oce_scorer = score_oce_scene_rollouts_device
-                    if oce_scorer is None:
-                        raise RuntimeError(
-                            "OCE weighting was requested, but the PyCUDA OCE evaluator "
-                            f"could not be imported: {_oce_import_error}"
-                        )
-                    if not callable(oce_scorer):
-                        raise TypeError("oce_data scorer/score_func must be callable.")
-                    oce_result = oce_scorer(
-                        scene=scene_payload,
-                        rollout_states_d=rollout_states_gpu,
-                        num_rollouts=int(self.samples),
-                        oce_config=oce_config,
-                        eps=oce_eps,
-                        entropy_space=entropy_space,
-                        discount=oce_discount,
-                        cuda_cache=_cuda_buffer_cache,
-                        materialize_host=oce_materialize_host,
-                        return_visibility_tensor=oce_return_visibility_tensor,
-                        rollout_state_stride=4,
-                        debug=bool(self.debug),
+                if occupancy_payload is not None:
+                    occupancy_host = occupancy_payload["grids"]
+                    occupancy_grids_gpu = _cuda.mem_alloc(occupancy_host.nbytes)  # type: ignore[attr-defined]
+                    occupancy_costs_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
+                    _cuda.memset_d8(occupancy_costs_gpu, 0, sample_cost_bytes)  # type: ignore[attr-defined]
+                    _cuda.memcpy_htod(occupancy_grids_gpu, occupancy_host)  # type: ignore[attr-defined]
+                    record_timing("occupancy_grid_upload")
+                    occupancy_weight = (
+                        self.mppi_occupancy_weight
+                        if occupancy_payload["soft_weight"] is None
+                        else occupancy_payload["soft_weight"]
                     )
-                    self.last_oce_result = oce_result
-                    if (
-                        hasattr(oce_result, "device_accumulation")
-                        and oce_result.device_accumulation is not None
-                    ):
-                        oce_cost_gpu = oce_result.device_accumulation.total_entropies_d
-                    else:
-                        host_costs = (
-                            oce_result
-                            if isinstance(oce_result, np.ndarray)
-                            else getattr(oce_result, "host_scores", None)
-                        )
-                        if (
-                            host_costs is None
-                            and hasattr(oce_result, "accumulation")
-                            and oce_result.accumulation is not None
-                        ):
-                            host_costs = getattr(
-                                oce_result.accumulation, "total_entropies", None
-                            )
-                        if host_costs is not None:
-                            host_costs = np.ascontiguousarray(
-                                np.asarray(host_costs, dtype=np.float32).reshape(-1)
-                            )
-                            if host_costs.shape[0] != int(self.samples):
-                                raise ValueError(
-                                    "OCE scorer host costs must have one value per sample."
-                                )
-                            owned_oce_cost_gpu = _cuda.mem_alloc(host_costs.nbytes)  # type: ignore[attr-defined]
-                            _cuda.memcpy_htod(owned_oce_cost_gpu, host_costs)  # type: ignore[attr-defined]
-                            oce_cost_gpu = owned_oce_cost_gpu
-                    if oce_cost_gpu is not None:
-                        add_sample_costs_func(
-                            u_weight_gpu,
-                            oce_cost_gpu,
-                            self.samples,
-                            block=block_1d,
-                            grid=grid_1d,
-                        )
-                    if self.debug:
-                        oce_queries = getattr(oce_result, "num_unique_queries", 0)
-                        print(
-                            f"[MPPI] OCE entropy_space={entropy_space} device evaluations={oce_queries}"
-                        )
-                    record_timing("oce_scoring", sync_cuda=True)
+                    add_occupancy_grid_costs_func(
+                        rollout_states_gpu,
+                        occupancy_grids_gpu,
+                        self.samples,
+                        np.int32(num_controls_timesteps),
+                        np.int32(occupancy_host.shape[0]),
+                        np.int32(occupancy_host.shape[1]),
+                        np.int32(occupancy_host.shape[2]),
+                        np.float32(occupancy_payload["origin"][0]),
+                        np.float32(occupancy_payload["origin"][1]),
+                        np.float32(occupancy_payload["resolution"]),
+                        np.float32(self.ego_collision_geometry[0]),
+                        np.float32(self.ego_collision_geometry[1]),
+                        np.float32(self.ego_collision_geometry[2]),
+                        np.float32(self.dynamic_collision_cost),
+                        np.float32(occupancy_weight),
+                        np.float32(occupancy_payload["hard_threshold"]),
+                        occupancy_costs_gpu,
+                        u_weight_gpu,
+                        block=block_1d,
+                        grid=grid_1d,
+                    )
+                    record_timing("occupancy_cost_kernel", sync_cuda=True)
+
+                # BUGBUG - Disable OCE as the scoring is expensive over 1000's of rollouts - for
+                #          now, the diversity comes from the route planner.  MPPI can focus on
+                #          a local collision free path.
+                #
+                # self.last_oce_result = None
+                # if discrete_oce_payload is not None:
+                #     if evaluate_discrete_oce_rollouts_gpu is None:
+                #         raise RuntimeError(
+                #             "Discrete OCE weighting was requested, but the PyCUDA "
+                #             "discrete OCE evaluator could not be imported: "
+                #             f"{_discrete_oce_import_error}"
+                #         )
+                #     discrete_inputs = _prepare_discrete_oce_rollout_inputs(
+                #         discrete_oce_payload,
+                #         num_controls_timesteps,
+                #     )
+                #     if discrete_inputs is not None:
+                #         discrete_horizon = min(
+                #             int(discrete_inputs["horizon"]),
+                #             int(num_controls_timesteps),
+                #         )
+                #         oce_result = evaluate_discrete_oce_rollouts_gpu(
+                #             rollout_states_d=rollout_states_gpu,
+                #             num_rollouts=int(self.samples),
+                #             x_init=np.asarray(x_init, dtype=np.float32),
+                #             rollout_state_stride=4,
+                #             state_centers=discrete_inputs["state_centers"],
+                #             static_grid=discrete_inputs["static_grid"],
+                #             grid_origin=discrete_inputs["grid_origin"],
+                #             grid_resolution=discrete_inputs["grid_resolution"],
+                #             transition_data=discrete_inputs["transition_data"],
+                #             transition_indices=discrete_inputs["transition_indices"],
+                #             transition_indptr=discrete_inputs["transition_indptr"],
+                #             prefix_beliefs=discrete_inputs["prefix_beliefs"][
+                #                 :, : discrete_horizon + 1, :
+                #             ],
+                #             beliefs=discrete_inputs["beliefs"],
+                #             horizon=discrete_horizon,
+                #             scan_range=discrete_inputs["scan_range"],
+                #             return_visibility=discrete_inputs["return_visibility"],
+                #             occupancy_probability_grids=discrete_inputs[
+                #                 "occupancy_probability_grids"
+                #             ],
+                #             occupancy_owner_mask_grids=discrete_inputs[
+                #                 "occupancy_owner_mask_grids"
+                #             ],
+                #             agent_owner_bits=discrete_inputs["agent_owner_bits"],
+                #             occupancy_threshold=discrete_inputs["occupancy_threshold"],
+                #             return_device_scores=True,
+                #         )
+                #         if getattr(oce_result, "metadata", None) is not None:
+                #             oce_result.metadata["state_reduction"] = discrete_inputs[
+                #                 "state_reduction"
+                #             ]
+                #         self.last_oce_result = oce_result
+                #         oce_cost_gpu = getattr(oce_result, "device_scores", None)
+                #         if oce_cost_gpu is None:
+                #             raise RuntimeError(
+                #                 "Discrete OCE rollout scoring did not return a device score buffer."
+                #             )
+                #         owned_oce_cost_gpu = oce_cost_gpu
+                #         add_sample_costs_func(
+                #             u_weight_gpu,
+                #             oce_cost_gpu,
+                #             self.samples,
+                #             block=block_1d,
+                #             grid=grid_1d,
+                #         )
+                #         if self.debug:
+                #             print(
+                #                 "[MPPI] OCE entropy_space=discrete "
+                #                 f"device evaluations={int(self.samples)} "
+                #                 f"agents={len(discrete_inputs['agent_ids'])} "
+                #                 f"states={discrete_inputs['state_reduction']['selected_states']}/"
+                #                 f"{discrete_inputs['state_reduction']['original_states']}"
+                #             )
+                #     record_timing("oce_scoring", sync_cuda=True)
+                # elif scene_payload is not None:
+                #     if oce_scorer is None:
+                #         oce_scorer = score_oce_scene_rollouts_device
+                #     if oce_scorer is None:
+                #         raise RuntimeError(
+                #             "OCE weighting was requested, but the PyCUDA OCE evaluator "
+                #             f"could not be imported: {_oce_import_error}"
+                #         )
+                #     if not callable(oce_scorer):
+                #         raise TypeError("oce_data scorer/score_func must be callable.")
+                #     oce_result = oce_scorer(
+                #         scene=scene_payload,
+                #         rollout_states_d=rollout_states_gpu,
+                #         num_rollouts=int(self.samples),
+                #         oce_config=oce_config,
+                #         eps=oce_eps,
+                #         entropy_space=entropy_space,
+                #         discount=oce_discount,
+                #         cuda_cache=_cuda_buffer_cache,
+                #         materialize_host=oce_materialize_host,
+                #         return_visibility_tensor=oce_return_visibility_tensor,
+                #         rollout_state_stride=4,
+                #         debug=bool(self.debug),
+                #     )
+                #     self.last_oce_result = oce_result
+                #     if (
+                #         hasattr(oce_result, "device_accumulation")
+                #         and oce_result.device_accumulation is not None
+                #     ):
+                #         oce_cost_gpu = oce_result.device_accumulation.total_entropies_d
+                #     else:
+                #         host_costs = (
+                #             oce_result
+                #             if isinstance(oce_result, np.ndarray)
+                #             else getattr(oce_result, "host_scores", None)
+                #         )
+                #         if (
+                #             host_costs is None
+                #             and hasattr(oce_result, "accumulation")
+                #             and oce_result.accumulation is not None
+                #         ):
+                #             host_costs = getattr(
+                #                 oce_result.accumulation, "total_entropies", None
+                #             )
+                #         if host_costs is not None:
+                #             host_costs = np.ascontiguousarray(
+                #                 np.asarray(host_costs, dtype=np.float32).reshape(-1)
+                #             )
+                #             if host_costs.shape[0] != int(self.samples):
+                #                 raise ValueError(
+                #                     "OCE scorer host costs must have one value per sample."
+                #                 )
+                #             owned_oce_cost_gpu = _cuda.mem_alloc(host_costs.nbytes)  # type: ignore[attr-defined]
+                #             _cuda.memcpy_htod(owned_oce_cost_gpu, host_costs)  # type: ignore[attr-defined]
+                #             oce_cost_gpu = owned_oce_cost_gpu
+                #     if oce_cost_gpu is not None:
+                #         add_sample_costs_func(
+                #             u_weight_gpu,
+                #             oce_cost_gpu,
+                #             self.samples,
+                #             block=block_1d,
+                #             grid=grid_1d,
+                #         )
+                #     if self.debug:
+                #         oce_queries = getattr(oce_result, "num_unique_queries", 0)
+                #         print(
+                #             f"[MPPI] OCE entropy_space={entropy_space} device evaluations={oce_queries}"
+                #         )
+                #     record_timing("oce_scoring", sync_cuda=True)
 
                 combined_costs_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
                 _cuda.memcpy_dtod(combined_costs_gpu, u_weight_gpu, sample_cost_bytes)  # type: ignore[attr-defined]
@@ -2460,7 +2998,7 @@ class MPPI:
                 record_timing("disturbance_download")
                 _cuda.memcpy_dtoh(u_weights_host, u_weight_gpu)  # type: ignore[attr-defined]
                 record_timing("weights_download")
-                if rollout_states_gpu is not None:
+                if rollout_states_gpu is not None and self.debug:
                     rollout_states_host = np.zeros(
                         (self.samples, num_controls_timesteps, 4), dtype=np.float32
                     )
@@ -2483,6 +3021,9 @@ class MPPI:
                 if dynamic_costs_gpu is not None:
                     _cuda.memcpy_dtoh(dynamic_costs_host, dynamic_costs_gpu)  # type: ignore[attr-defined]
                     component_costs_host[:, 4] = dynamic_costs_host
+                occupancy_costs_host = np.zeros(self.samples, dtype=np.float32)
+                if occupancy_costs_gpu is not None:
+                    _cuda.memcpy_dtoh(occupancy_costs_host, occupancy_costs_gpu)  # type: ignore[attr-defined]
                 record_timing("cost_components_download")
 
                 # Diagnostics
@@ -2500,6 +3041,7 @@ class MPPI:
                     "visibility": component_costs_host[:, 3],
                     "dynamic_obstacle": component_costs_host[:, 4],
                     "oce": oce_costs_host,
+                    "occupancy": occupancy_costs_host,
                 }
                 self.last_dynamic_clearance_summary = None
                 # if (
@@ -2596,6 +3138,8 @@ class MPPI:
                     dynamic_costs_gpu,
                     dynamic_actor_states_gpu,
                     dynamic_actor_geometry_gpu,
+                    occupancy_grids_gpu,
+                    occupancy_costs_gpu,
                     owned_oce_cost_gpu,
                     u_weight_min_gpu,
                     u_weight_total_gpu,
