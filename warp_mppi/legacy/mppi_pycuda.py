@@ -872,6 +872,9 @@ _MPPI_CUDA_SOURCE = """
         float static_hard_clearance_margin;
         float static_clearance_margin;
         float static_clearance_weight;
+        int dynamics_type; // 0=Ackermann, 1=holonomic
+        float holonomic_max_heading_change;
+        float holonomic_max_curvature;
     };
 
     struct Obstacle {
@@ -1481,6 +1484,44 @@ _MPPI_CUDA_SOURCE = """
       result->theta = (k1.theta + 2.0 * (k2.theta + k3.theta) + k4.theta) / 6.0;
     }
 
+    inline __device__
+    float wrap_angle(float angle) {
+      return fmodf(angle + 3.0f * M_PI, 2.0f * M_PI) - M_PI;
+    }
+
+    __device__
+    void holonomic_step(
+            const State *state,
+            const Control *control,
+            float dt,
+            float max_speed,
+            float max_heading_change,
+            float max_curvature,
+            State *result
+    ) {
+      float vx = control->a;
+      float vy = control->delta;
+      float speed = hypotf(vx, vy);
+      if (speed <= FLT_EPSILON || dt <= 0.0f) {
+        *result = *state;
+        result->v = 0.0f;
+        return;
+      }
+      speed = fminf(speed, fmaxf(max_speed, 0.0f));
+      float requested_heading = atan2f(vy, vx);
+      float allowed_change = fminf(
+          fmaxf(max_heading_change, 0.0f),
+          fmaxf(max_curvature, 0.0f) * speed * dt
+      );
+      float heading_error = wrap_angle(requested_heading - state->theta);
+      float accepted_change = fminf(fmaxf(heading_error, -allowed_change), allowed_change);
+      float accepted_heading = wrap_angle(state->theta + accepted_change);
+      result->x = state->x + speed * cosf(accepted_heading) * dt;
+      result->y = state->y + speed * sinf(accepted_heading) * dt;
+      result->v = speed;
+      result->theta = accepted_heading;
+    }
+
 
     __device__
     void generate_controls(
@@ -1490,6 +1531,7 @@ _MPPI_CUDA_SOURCE = """
             const int num_controls,
             const float *u_limits,
             const float *u_dist_limits,
+            int dynamics_type,
             Control *u_dist
     ) {
       curandState localState = globalState[index];
@@ -1504,6 +1546,15 @@ _MPPI_CUDA_SOURCE = """
                 float delta_z_noise = curand_normal(&localState) * (u_dist_limits[1] / fmaxf(u_limits[1], FLT_EPSILON));
                 float a_candidate = squash_control(a_z_nom + a_z_noise, u_limits[0]);
                 float delta_candidate = squash_control(delta_z_nom + delta_z_noise, u_limits[1]);
+                if (dynamics_type == 1) {
+                    float magnitude = hypotf(a_candidate, delta_candidate);
+                    float max_speed = fmaxf(u_limits[0], 0.0f);
+                    if (magnitude > max_speed && magnitude > FLT_EPSILON) {
+                        float scale = max_speed / magnitude;
+                        a_candidate *= scale;
+                        delta_candidate *= scale;
+                    }
+                }
                 // Store disturbance (difference from nominal)
                 u_dist[i].a = a_candidate - u_nom[i].a;
                 u_dist[i].delta = delta_candidate - u_nom[i].delta;
@@ -1574,7 +1625,7 @@ _MPPI_CUDA_SOURCE = """
             const State *x_goal_state = reinterpret_cast<const State *>(optimization_args->x_goal);
             Control *u_dist_controls = reinterpret_cast<Control *>(&u_dists[sample_index * num_controls]);
 
-            generate_controls(globalState, sample_index, u_nom, num_controls, u_limits, u_dist_limits, u_dist_controls);
+            generate_controls(globalState, sample_index, u_nom, num_controls, u_limits, u_dist_limits, optimization_args->dynamics_type, u_dist_controls);
 
             State current_state = {x_init_state->x, x_init_state->y, x_init_state->v, x_init_state->theta};
             State state_step = {0, 0, 0, 0};
@@ -1582,9 +1633,21 @@ _MPPI_CUDA_SOURCE = """
             for (int i = 1; i <= num_controls; i++) {
                 // generate the next state
                 Control c = {u_nom[i - 1].a + u_dist_controls[i - 1].a, u_nom[i - 1].delta + u_dist_controls[i - 1].delta};
-                // runge_kutta_step returns derivative, we multiply by dt here
-                runge_kutta_step(&current_state, &c, optimization_args->vehicle_length, dt, &state_step);
-                update_state(&current_state, &state_step, dt, &current_state);
+                if (optimization_args->dynamics_type == 1) {
+                    holonomic_step(
+                        &current_state,
+                        &c,
+                        dt,
+                        u_limits[0],
+                        optimization_args->holonomic_max_heading_change,
+                        optimization_args->holonomic_max_curvature,
+                        &current_state
+                    );
+                } else {
+                    // runge_kutta_step returns derivative, we multiply by dt here
+                    runge_kutta_step(&current_state, &c, optimization_args->vehicle_length, dt, &state_step);
+                    update_state(&current_state, &state_step, dt, &current_state);
+                }
                 if (rollout_states != NULL) {
                     rollout_states[sample_index * num_controls + (i - 1)] = current_state;
                 }
@@ -1615,7 +1678,7 @@ _MPPI_CUDA_SOURCE = """
                               (c.delta - u_nom[i - 1].delta) * R[1] * (c.delta - u_nom[i - 1].delta);
 
                 // optional steering rate penalty (difference between successive applied steering commands)
-                if (optimization_args->steering_rate_weight > 0.0f && i > 1) {
+                if (optimization_args->dynamics_type == 0 && optimization_args->steering_rate_weight > 0.0f && i > 1) {
                     float prev_delta = u_nom[i - 2].delta + u_dist_controls[i - 2].delta; // previous applied delta
                     float rate = c.delta - prev_delta; // instantaneous change (already per-step)
                     control_err += optimization_args->steering_rate_weight * rate * rate;
@@ -2026,16 +2089,19 @@ _MPPI_CUDA_SOURCE = """
             float a_candidate = a_nom + u_dist[dist_flat_idx].a;
             float delta_candidate = delta_nom + u_dist[dist_flat_idx].delta;
 
-            float a_nom_z = unsquash_control(a_nom, u_limits[0]);
-            float delta_nom_z = unsquash_control(delta_nom, u_limits[1]);
-            float a_candidate_z = unsquash_control(a_candidate, u_limits[0]);
-            float delta_candidate_z = unsquash_control(delta_candidate, u_limits[1]);
+            if (optimization_args->dynamics_type == 1) {
+                atomicAdd(&(u_mppi[ctrl_idx].a), (a_candidate - a_nom) * weight_normalized);
+                atomicAdd(&(u_mppi[ctrl_idx].delta), (delta_candidate - delta_nom) * weight_normalized);
+            } else {
+                float a_nom_z = unsquash_control(a_nom, u_limits[0]);
+                float delta_nom_z = unsquash_control(delta_nom, u_limits[1]);
+                float a_candidate_z = unsquash_control(a_candidate, u_limits[0]);
+                float delta_candidate_z = unsquash_control(delta_candidate, u_limits[1]);
 
-            // u_mppi was initialized with nominal z-space controls. Accumulate
-            // the weighted z-space update; the host maps it back to bounded
-            // controls after this kernel completes.
-            atomicAdd(&(u_mppi[ctrl_idx].a), (a_candidate_z - a_nom_z) * weight_normalized);
-            atomicAdd(&(u_mppi[ctrl_idx].delta), (delta_candidate_z - delta_nom_z) * weight_normalized);
+                // Ackermann controls are accumulated in unconstrained space.
+                atomicAdd(&(u_mppi[ctrl_idx].a), (a_candidate_z - a_nom_z) * weight_normalized);
+                atomicAdd(&(u_mppi[ctrl_idx].delta), (delta_candidate_z - delta_nom_z) * weight_normalized);
+            }
         }
       }
     }
@@ -2165,6 +2231,9 @@ class MPPI:
             ("static_hard_clearance_margin", np.float32),
             ("static_clearance_margin", np.float32),
             ("static_clearance_weight", np.float32),
+            ("dynamics_type", np.int32),
+            ("holonomic_max_heading_change", np.float32),
+            ("holonomic_max_curvature", np.float32),
         ]
     )
 
@@ -2203,6 +2272,9 @@ class MPPI:
         static_collision_cost=float(LARGE_COLLISION_COST),
         static_hard_clearance_margin=0.0,
         mppi_occupancy_weight=None,
+        dynamics_type="ackermann",
+        holonomic_max_heading_change=0.0,
+        holonomic_max_curvature=0.0,
     ):
         """Initialize MPPI controller.
 
@@ -2217,6 +2289,9 @@ class MPPI:
         self.debug = debug
         self.vehicle_length = float(vehicle_length)
         self.vehicle_width = float(vehicle_width)
+        self.dynamics_type = str(dynamics_type).strip().lower()
+        if self.dynamics_type not in {"ackermann", "holonomic"}:
+            raise ValueError("dynamics_type must be 'ackermann' or 'holonomic'")
         self.dynamic_clearance_margin = float(dynamic_clearance_margin)
         self.dynamic_clearance_weight = float(dynamic_clearance_weight)
         self.dynamic_collision_cost = float(dynamic_collision_cost)
@@ -2269,6 +2344,15 @@ class MPPI:
         )
         self.optimization_args["static_clearance_weight"] = np.float32(
             self.static_clearance_weight
+        )
+        self.optimization_args["dynamics_type"] = np.int32(
+            1 if self.dynamics_type == "holonomic" else 0
+        )
+        self.optimization_args["holonomic_max_heading_change"] = np.float32(
+            holonomic_max_heading_change
+        )
+        self.optimization_args["holonomic_max_curvature"] = np.float32(
+            holonomic_max_curvature
         )
 
         # Allocate GPU buffers inside context
@@ -2949,20 +3033,23 @@ class MPPI:
                 # Accumulate weighted disturbances in unconstrained control space.
                 # This avoids biasing saturated steering commands back toward zero.
                 u_limits_host = self.optimization_args["u_limits"][0]
-                unit_u_nom = np.zeros_like(u_nom_host)
-                unit_u_nom[:, 0] = np.clip(
-                    u_nom_host[:, 0]
-                    / max(float(u_limits_host[0]), np.finfo(np.float32).eps),
-                    -1.0 + 1e-5,
-                    1.0 - 1e-5,
-                )
-                unit_u_nom[:, 1] = np.clip(
-                    u_nom_host[:, 1]
-                    / max(float(u_limits_host[1]), np.finfo(np.float32).eps),
-                    -1.0 + 1e-5,
-                    1.0 - 1e-5,
-                )
-                u_nom_z_host = np.arctanh(unit_u_nom).astype(np.float32)
+                if self.dynamics_type == "holonomic":
+                    u_nom_z_host = u_nom_host.copy()
+                else:
+                    unit_u_nom = np.zeros_like(u_nom_host)
+                    unit_u_nom[:, 0] = np.clip(
+                        u_nom_host[:, 0]
+                        / max(float(u_limits_host[0]), np.finfo(np.float32).eps),
+                        -1.0 + 1e-5,
+                        1.0 - 1e-5,
+                    )
+                    unit_u_nom[:, 1] = np.clip(
+                        u_nom_host[:, 1]
+                        / max(float(u_limits_host[1]), np.finfo(np.float32).eps),
+                        -1.0 + 1e-5,
+                        1.0 - 1e-5,
+                    )
+                    u_nom_z_host = np.arctanh(unit_u_nom).astype(np.float32)
 
                 u_mppi_gpu = _cuda.mem_alloc(u_nom_host.nbytes)  # type: ignore[attr-defined]
                 _cuda.memcpy_htod(u_mppi_gpu, u_nom_z_host)  # type: ignore[attr-defined]
@@ -2983,8 +3070,19 @@ class MPPI:
 
                 # Copy back
                 _cuda.memcpy_dtoh(u_mppi_host, u_mppi_gpu)  # type: ignore[attr-defined]
-                u_mppi_host[:, 0] = u_limits_host[0] * np.tanh(u_mppi_host[:, 0])
-                u_mppi_host[:, 1] = u_limits_host[1] * np.tanh(u_mppi_host[:, 1])
+                if self.dynamics_type == "holonomic":
+                    magnitudes = np.linalg.norm(u_mppi_host[:, :2], axis=1)
+                    over_limit = magnitudes > float(u_limits_host[0])
+                    u_mppi_host[over_limit, :2] *= (
+                        float(u_limits_host[0]) / magnitudes[over_limit]
+                    )[:, np.newaxis]
+                else:
+                    u_mppi_host[:, 0] = u_limits_host[0] * np.tanh(
+                        u_mppi_host[:, 0]
+                    )
+                    u_mppi_host[:, 1] = u_limits_host[1] * np.tanh(
+                        u_mppi_host[:, 1]
+                    )
                 record_timing("control_download")
 
                 u_dist_raw_host = np.zeros(
