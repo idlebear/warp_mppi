@@ -637,14 +637,31 @@ __device__ void dense_scheduled_transition_step(
     int num_states,
     int agent_idx,
     int step,
-    int planning_speed
+    int planning_speed,
+    const int* transition_steps
 ) {
     int tid = threadIdx.x;
-    if (transition_active_at_step(step, planning_speed)) {
-        dense_transition_step(transitions, src, dst, num_states, agent_idx);
-    } else {
+    int count = transition_steps != NULL
+        ? transition_steps[step - 1]
+        : (transition_active_at_step(step, planning_speed) ? 1 : 0);
+    if (count <= 0) {
         for (int j = tid; j < num_states; j += blockDim.x) {
             dst[j] = src[j];
+        }
+        return;
+    }
+    const float* read = src;
+    float* write = dst;
+    for (int repeat = 0; repeat < count; ++repeat) {
+        dense_transition_step(transitions, read, write, num_states, agent_idx);
+        __syncthreads();
+        const float* completed = write;
+        write = (write == dst) ? (float*)src : dst;
+        read = completed;
+    }
+    if (read != dst) {
+        for (int j = tid; j < num_states; j += blockDim.x) {
+            dst[j] = read[j];
         }
     }
 }
@@ -658,14 +675,31 @@ __device__ void csr_scheduled_transition_step(
     int num_states,
     int agent_idx,
     int step,
-    int planning_speed
+    int planning_speed,
+    const int* transition_steps
 ) {
     int tid = threadIdx.x;
-    if (transition_active_at_step(step, planning_speed)) {
-        csr_transition_step(data, indices, indptr, src, dst, num_states, agent_idx);
-    } else {
+    int count = transition_steps != NULL
+        ? transition_steps[step - 1]
+        : (transition_active_at_step(step, planning_speed) ? 1 : 0);
+    if (count <= 0) {
         for (int j = tid; j < num_states; j += blockDim.x) {
             dst[j] = src[j];
+        }
+        return;
+    }
+    const float* read = src;
+    float* write = dst;
+    for (int repeat = 0; repeat < count; ++repeat) {
+        csr_transition_step(data, indices, indptr, read, write, num_states, agent_idx);
+        __syncthreads();
+        const float* completed = write;
+        write = (write == dst) ? (float*)src : dst;
+        read = completed;
+    }
+    if (read != dst) {
+        for (int j = tid; j < num_states; j += blockDim.x) {
+            dst[j] = read[j];
         }
     }
 }
@@ -973,6 +1007,7 @@ __global__ void discrete_exact_entropy_partition_scores(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* step_entropy,
     float* step_probability,
     float* step_spatial_separation,
@@ -1034,7 +1069,7 @@ __global__ void discrete_exact_entropy_partition_scores(
         }
         __syncthreads();
         for (int t = 1; t <= k; ++t) {
-            dense_scheduled_transition_step(transitions, work, next, num_states, agent, t, planning_speed);
+            dense_scheduled_transition_step(transitions, work, next, num_states, agent, t, planning_speed, transition_steps);
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
                 int occ_idx = occlusion_offset(path, agent, t, j, num_agents, horizon + 1, num_states);
@@ -1055,7 +1090,7 @@ __global__ void discrete_exact_entropy_partition_scores(
         }
         __syncthreads();
         for (int t = partition_step + 1; t <= k; ++t) {
-            dense_scheduled_transition_step(transitions, work, next, num_states, agent, t, planning_speed);
+            dense_scheduled_transition_step(transitions, work, next, num_states, agent, t, planning_speed, transition_steps);
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
                 int occ_idx = occlusion_offset(path, agent, t, j, num_agents, horizon + 1, num_states);
@@ -1102,6 +1137,7 @@ __global__ void discrete_exact_entropy_partition_scores_csr(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* step_entropy,
     float* step_probability,
     float* step_spatial_separation,
@@ -1172,7 +1208,8 @@ __global__ void discrete_exact_entropy_partition_scores_csr(
                 num_states,
                 agent,
                 t,
-                planning_speed
+                planning_speed,
+                transition_steps
             );
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
@@ -1203,7 +1240,8 @@ __global__ void discrete_exact_entropy_partition_scores_csr(
                 num_states,
                 agent,
                 t,
-                planning_speed
+                planning_speed,
+                transition_steps
             );
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
@@ -1257,6 +1295,7 @@ __global__ void discrete_exact_entropy_active_partition_scores_csr(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* step_entropy,
     float* step_probability,
     float* step_spatial_separation,
@@ -1315,7 +1354,8 @@ __global__ void discrete_exact_entropy_active_partition_scores_csr(
                 num_states,
                 agent,
                 t,
-                planning_speed
+                planning_speed,
+                transition_steps
             );
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
@@ -1346,7 +1386,8 @@ __global__ void discrete_exact_entropy_active_partition_scores_csr(
                 num_states,
                 agent,
                 t,
-                planning_speed
+                planning_speed,
+                transition_steps
             );
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
@@ -1392,6 +1433,7 @@ __global__ void discrete_approximate_entropy_partition_scores(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* step_entropy,
     float* step_probability,
     float* step_spatial_separation,
@@ -1444,7 +1486,7 @@ __global__ void discrete_approximate_entropy_partition_scores(
         }
         __syncthreads();
         for (int t = 1; t <= k; ++t) {
-            dense_scheduled_transition_step(transitions, work, next, num_states, agent, t, planning_speed);
+            dense_scheduled_transition_step(transitions, work, next, num_states, agent, t, planning_speed, transition_steps);
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
                 int occ_idx = occlusion_offset(path, agent, t, j, num_agents, horizon + 1, num_states);
@@ -1462,7 +1504,7 @@ __global__ void discrete_approximate_entropy_partition_scores(
         }
         __syncthreads();
         for (int t = partition_step + 1; t <= k; ++t) {
-            dense_scheduled_transition_step(transitions, work, next, num_states, agent, t, planning_speed);
+            dense_scheduled_transition_step(transitions, work, next, num_states, agent, t, planning_speed, transition_steps);
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
                 int occ_idx = occlusion_offset(path, agent, t, j, num_agents, horizon + 1, num_states);
@@ -1509,6 +1551,7 @@ __global__ void discrete_approximate_entropy_partition_scores_csr(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* step_entropy,
     float* step_probability,
     float* step_spatial_separation,
@@ -1570,7 +1613,8 @@ __global__ void discrete_approximate_entropy_partition_scores_csr(
                 num_states,
                 agent,
                 t,
-                planning_speed
+                planning_speed,
+                transition_steps
             );
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
@@ -1598,7 +1642,8 @@ __global__ void discrete_approximate_entropy_partition_scores_csr(
                 num_states,
                 agent,
                 t,
-                planning_speed
+                planning_speed,
+                transition_steps
             );
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
@@ -1740,6 +1785,7 @@ __global__ void discrete_combined_jsd_exact_partition_scores(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* step_entropy,
     float* step_probability,
     float* step_spatial_separation,
@@ -1804,7 +1850,7 @@ __global__ void discrete_combined_jsd_exact_partition_scores(
             }
             __syncthreads();
             for (int t = 1; t <= k; ++t) {
-                dense_scheduled_transition_step(transitions, work, state_mix, num_states, row, t, planning_speed);
+                dense_scheduled_transition_step(transitions, work, state_mix, num_states, row, t, planning_speed, transition_steps);
                 __syncthreads();
                 for (int j = tid; j < num_states; j += blockDim.x) {
                     int occ_idx = occlusion_offset(path, row, t, j, num_mode_rows, horizon + 1, num_states);
@@ -1829,7 +1875,7 @@ __global__ void discrete_combined_jsd_exact_partition_scores(
                 }
                 __syncthreads();
                 for (int t = partition_step + 1; t <= k; ++t) {
-                    dense_scheduled_transition_step(transitions, work, state_mix, num_states, row, t, planning_speed);
+                    dense_scheduled_transition_step(transitions, work, state_mix, num_states, row, t, planning_speed, transition_steps);
                     __syncthreads();
                     for (int j = tid; j < num_states; j += blockDim.x) {
                         int future_occ_idx = occlusion_offset(path, row, t, j, num_mode_rows, horizon + 1, num_states);
@@ -1893,6 +1939,7 @@ __global__ void discrete_combined_jsd_exact_partition_scores_csr(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* step_entropy,
     float* step_probability,
     float* step_spatial_separation,
@@ -1966,7 +2013,8 @@ __global__ void discrete_combined_jsd_exact_partition_scores_csr(
                     num_states,
                     row,
                     t,
-                    planning_speed
+                    planning_speed,
+                    transition_steps
                 );
                 __syncthreads();
                 for (int j = tid; j < num_states; j += blockDim.x) {
@@ -2001,7 +2049,8 @@ __global__ void discrete_combined_jsd_exact_partition_scores_csr(
                         num_states,
                         row,
                         t,
-                        planning_speed
+                        planning_speed,
+                        transition_steps
                     );
                     __syncthreads();
                     for (int j = tid; j < num_states; j += blockDim.x) {
@@ -2064,6 +2113,7 @@ __global__ void discrete_combined_jsd_approximate_partition_scores(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* step_entropy,
     float* step_probability,
     float* step_spatial_separation,
@@ -2125,7 +2175,7 @@ __global__ void discrete_combined_jsd_approximate_partition_scores(
             }
             __syncthreads();
             for (int t = 1; t <= k; ++t) {
-                dense_scheduled_transition_step(transitions, work, state_mix, num_states, row, t, planning_speed);
+                dense_scheduled_transition_step(transitions, work, state_mix, num_states, row, t, planning_speed, transition_steps);
                 __syncthreads();
                 for (int j = tid; j < num_states; j += blockDim.x) {
                     int occ_idx = occlusion_offset(path, row, t, j, num_mode_rows, horizon + 1, num_states);
@@ -2143,7 +2193,7 @@ __global__ void discrete_combined_jsd_approximate_partition_scores(
             }
             __syncthreads();
             for (int t = partition_step + 1; t <= k; ++t) {
-                dense_scheduled_transition_step(transitions, work, state_mix, num_states, row, t, planning_speed);
+                dense_scheduled_transition_step(transitions, work, state_mix, num_states, row, t, planning_speed, transition_steps);
                 __syncthreads();
                 for (int j = tid; j < num_states; j += blockDim.x) {
                     int occ_idx = occlusion_offset(path, row, t, j, num_mode_rows, horizon + 1, num_states);
@@ -2206,6 +2256,7 @@ __global__ void discrete_combined_jsd_approximate_partition_scores_csr(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* step_entropy,
     float* step_probability,
     float* step_spatial_separation,
@@ -2276,7 +2327,8 @@ __global__ void discrete_combined_jsd_approximate_partition_scores_csr(
                     num_states,
                     row,
                     t,
-                    planning_speed
+                    planning_speed,
+                    transition_steps
                 );
                 __syncthreads();
                 for (int j = tid; j < num_states; j += blockDim.x) {
@@ -2304,7 +2356,8 @@ __global__ void discrete_combined_jsd_approximate_partition_scores_csr(
                     num_states,
                     row,
                     t,
-                    planning_speed
+                        planning_speed,
+                        transition_steps
                 );
                 __syncthreads();
                 for (int j = tid; j < num_states; j += blockDim.x) {
@@ -2369,6 +2422,7 @@ __global__ void discrete_exact_entropy_active_partition_scores_csr_score_only(
     int next_sensor_step,
     int sensing_interval,
     int planning_speed,
+    const int* transition_steps,
     float* path_scores
 ) {
     int task = blockIdx.x;
@@ -2423,7 +2477,8 @@ __global__ void discrete_exact_entropy_active_partition_scores_csr_score_only(
                 num_states,
                 agent,
                 t,
-                planning_speed
+                planning_speed,
+                transition_steps
             );
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
@@ -2454,7 +2509,8 @@ __global__ void discrete_exact_entropy_active_partition_scores_csr_score_only(
                 num_states,
                 agent,
                 t,
-                planning_speed
+                planning_speed,
+                transition_steps
             );
             __syncthreads();
             for (int j = tid; j < num_states; j += blockDim.x) {
@@ -2698,6 +2754,7 @@ def _evaluate_discrete_oce_gpu_impl(
     next_sensor_step: int = 0,
     sensing_interval: int = 1,
     planning_speed: int = 1,
+    transition_steps: np.ndarray | None = None,
     return_visibility: bool = False,
     return_belief_sums: bool = False,
     occupancy_probability_grids: np.ndarray | None = None,
@@ -2847,6 +2904,23 @@ def _evaluate_discrete_oce_gpu_impl(
         num_paths = int(num_rollouts)
         horizon = int(horizon)
         horizon_plus_one = horizon + 1
+    if transition_steps is None:
+        transition_steps = np.asarray(
+            [
+                1 if (step - 1) % planning_speed == 0 else 0
+                for step in range(1, horizon + 1)
+            ],
+            dtype=np.int32,
+        )
+    else:
+        transition_steps = np.ascontiguousarray(
+            np.asarray(transition_steps, dtype=np.int32).reshape(-1)
+        )
+        if transition_steps.shape != (horizon,) or np.any(transition_steps < 0):
+            raise ValueError(
+                "transition_steps must contain one nonnegative count per "
+                "outer trajectory step"
+            )
     num_states = int(state_centers.shape[0])
     if state_coords is not None and int(state_coords.shape[0]) != num_states:
         raise ValueError("state_coords dimensions do not match state_centers")
@@ -3006,6 +3080,7 @@ def _evaluate_discrete_oce_gpu_impl(
                 "next_sensor_step": next_sensor_step,
                 "sensing_interval": sensing_interval,
                 "planning_speed": planning_speed,
+                "transition_step_sum": int(transition_steps.sum()),
             },
         )
     if num_states != beliefs.shape[1]:
@@ -3066,15 +3141,12 @@ def _evaluate_discrete_oce_gpu_impl(
             prefix_beliefs[:, 0, :] = beliefs
             for agent_idx in range(num_agents):
                 for step in range(1, horizon + 1):
-                    if (step - 1) % planning_speed == 0:
-                        prefix_beliefs[agent_idx, step] = (
-                            prefix_beliefs[agent_idx, step - 1]
-                            @ transition_matrices[agent_idx]
-                        )
-                    else:
-                        prefix_beliefs[agent_idx, step] = prefix_beliefs[
-                            agent_idx, step - 1
-                        ]
+                    prefix_beliefs[agent_idx, step] = prefix_beliefs[
+                        agent_idx, step - 1
+                    ] @ np.linalg.matrix_power(
+                        transition_matrices[agent_idx],
+                        int(transition_steps[step - 1]),
+                    )
         else:
             prefix_beliefs = np.ascontiguousarray(prefix_beliefs, dtype=np.float32)
             if prefix_beliefs.shape != (num_agents, horizon + 1, num_states):
@@ -3103,6 +3175,7 @@ def _evaluate_discrete_oce_gpu_impl(
             owner_masks_d = np.intp(0)
             occupancy_steps = 0
         prefix_d = _alloc_and_copy(prefix_beliefs)
+        transition_steps_d = _alloc_and_copy(transition_steps)
         if use_csr:
             transition_data_d = _alloc_and_copy(transition_data)
             transition_indices_d = _alloc_and_copy(transition_indices)
@@ -3257,6 +3330,7 @@ def _evaluate_discrete_oce_gpu_impl(
                     np.int32(next_sensor_step),
                     np.int32(sensing_interval),
                     np.int32(planning_speed),
+                    transition_steps_d,
                     step_entropy_d,
                     step_probability_d,
                     step_spatial_separation_d,
@@ -3283,6 +3357,7 @@ def _evaluate_discrete_oce_gpu_impl(
                     np.int32(next_sensor_step),
                     np.int32(sensing_interval),
                     np.int32(planning_speed),
+                    transition_steps_d,
                     step_entropy_d,
                     step_probability_d,
                     step_spatial_separation_d,
@@ -3317,6 +3392,7 @@ def _evaluate_discrete_oce_gpu_impl(
                     np.int32(next_sensor_step),
                     np.int32(sensing_interval),
                     np.int32(planning_speed),
+                    transition_steps_d,
                     step_entropy_d,
                     step_probability_d,
                     step_spatial_separation_d,
@@ -3339,6 +3415,7 @@ def _evaluate_discrete_oce_gpu_impl(
                     np.int32(next_sensor_step),
                     np.int32(sensing_interval),
                     np.int32(planning_speed),
+                    transition_steps_d,
                     step_entropy_d,
                     step_probability_d,
                     step_spatial_separation_d,
@@ -3415,6 +3492,7 @@ def _evaluate_discrete_oce_gpu_impl(
                         np.int32(next_sensor_step),
                         np.int32(sensing_interval),
                         np.int32(planning_speed),
+                        transition_steps_d,
                         scores_d,
                         block=(block, 1, 1),
                         grid=score_grid,
@@ -3441,6 +3519,7 @@ def _evaluate_discrete_oce_gpu_impl(
                         np.int32(next_sensor_step),
                         np.int32(sensing_interval),
                         np.int32(planning_speed),
+                        transition_steps_d,
                         step_entropy_d,
                         step_probability_d,
                         step_spatial_separation_d,
@@ -3473,6 +3552,7 @@ def _evaluate_discrete_oce_gpu_impl(
                         np.int32(next_sensor_step),
                         np.int32(sensing_interval),
                         np.int32(planning_speed),
+                        transition_steps_d,
                         step_entropy_d,
                         step_probability_d,
                         step_spatial_separation_d,
@@ -3495,6 +3575,7 @@ def _evaluate_discrete_oce_gpu_impl(
                         np.int32(next_sensor_step),
                         np.int32(sensing_interval),
                         np.int32(planning_speed),
+                        transition_steps_d,
                         step_entropy_d,
                         step_probability_d,
                         step_spatial_separation_d,
@@ -3687,6 +3768,9 @@ def _evaluate_discrete_oce_gpu_impl(
             "next_sensor_step": next_sensor_step,
             "sensing_interval": sensing_interval,
             "planning_speed": planning_speed,
+            "transition_step_sum": int(transition_steps.sum()),
+            "transition_step_min": int(transition_steps.min()),
+            "transition_step_max": int(transition_steps.max()),
         },
     )
 
@@ -3713,6 +3797,7 @@ def evaluate_discrete_oce_gpu(
     next_sensor_step: int = 0,
     sensing_interval: int = 1,
     planning_speed: int = 1,
+    transition_steps: np.ndarray | None = None,
     return_visibility: bool = False,
     return_belief_sums: bool = False,
     occupancy_probability_grids: np.ndarray | None = None,
@@ -3744,6 +3829,7 @@ def evaluate_discrete_oce_gpu(
         next_sensor_step=next_sensor_step,
         sensing_interval=sensing_interval,
         planning_speed=planning_speed,
+        transition_steps=transition_steps,
         return_visibility=return_visibility,
         return_belief_sums=return_belief_sums,
         occupancy_probability_grids=occupancy_probability_grids,
@@ -3781,6 +3867,7 @@ def evaluate_discrete_oce_rollouts_gpu(
     next_sensor_step: int = 0,
     sensing_interval: int = 1,
     planning_speed: int = 1,
+    transition_steps: np.ndarray | None = None,
     return_visibility: bool = False,
     return_belief_sums: bool = False,
     occupancy_probability_grids: np.ndarray | None = None,
@@ -3816,6 +3903,7 @@ def evaluate_discrete_oce_rollouts_gpu(
         next_sensor_step=next_sensor_step,
         sensing_interval=sensing_interval,
         planning_speed=planning_speed,
+        transition_steps=transition_steps,
         return_visibility=return_visibility,
         return_belief_sums=return_belief_sums,
         occupancy_probability_grids=occupancy_probability_grids,
