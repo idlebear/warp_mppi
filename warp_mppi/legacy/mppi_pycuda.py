@@ -872,7 +872,7 @@ _MPPI_CUDA_SOURCE = """
         float static_hard_clearance_margin;
         float static_clearance_margin;
         float static_clearance_weight;
-        int dynamics_type; // 0=Ackermann, 1=holonomic
+        int dynamics_type; // 0=Ackermann, 1=holonomic, 2=skid-steer
         float holonomic_max_heading_change;
         float holonomic_max_curvature;
     };
@@ -1486,7 +1486,11 @@ _MPPI_CUDA_SOURCE = """
 
     inline __device__
     float wrap_angle(float angle) {
-      return fmodf(angle + 3.0f * M_PI, 2.0f * M_PI) - M_PI;
+      float wrapped = fmodf(angle + M_PI, 2.0f * M_PI);
+      if (wrapped < 0.0f) {
+        wrapped += 2.0f * M_PI;
+      }
+      return wrapped - M_PI;
     }
 
     __device__
@@ -1520,6 +1524,39 @@ _MPPI_CUDA_SOURCE = """
       result->y = state->y + speed * sinf(accepted_heading) * dt;
       result->v = speed;
       result->theta = accepted_heading;
+    }
+
+    __device__
+    void skidsteer_step(
+            const State *state,
+            const Control *control,
+            float dt,
+            float max_linear_speed,
+            float max_angular_speed,
+            State *result
+    ) {
+      float v = fminf(
+          fmaxf(control->a, -fmaxf(max_linear_speed, 0.0f)),
+          fmaxf(max_linear_speed, 0.0f)
+      );
+      float omega = fminf(
+          fmaxf(control->delta, -fmaxf(max_angular_speed, 0.0f)),
+          fmaxf(max_angular_speed, 0.0f)
+      );
+      float theta = state->theta;
+      float next_theta = theta + omega * dt;
+      result->x = state->x;
+      result->y = state->y;
+      if (fabsf(omega) <= 1.0e-8f) {
+          result->x += v * cosf(theta) * dt;
+          result->y += v * sinf(theta) * dt;
+      } else {
+          float radius = v / omega;
+          result->x += radius * (sinf(next_theta) - sinf(theta));
+          result->y -= radius * (cosf(next_theta) - cosf(theta));
+      }
+      result->v = v;
+      result->theta = wrap_angle(next_theta);
     }
 
 
@@ -1641,6 +1678,15 @@ _MPPI_CUDA_SOURCE = """
                         u_limits[0],
                         optimization_args->holonomic_max_heading_change,
                         optimization_args->holonomic_max_curvature,
+                        &current_state
+                    );
+                } else if (optimization_args->dynamics_type == 2) {
+                    skidsteer_step(
+                        &current_state,
+                        &c,
+                        dt,
+                        u_limits[0],
+                        u_limits[1],
                         &current_state
                     );
                 } else {
@@ -2098,7 +2144,8 @@ _MPPI_CUDA_SOURCE = """
                 float a_candidate_z = unsquash_control(a_candidate, u_limits[0]);
                 float delta_candidate_z = unsquash_control(delta_candidate, u_limits[1]);
 
-                // Ackermann controls are accumulated in unconstrained space.
+                // Ackermann and skid-steer scalar controls are accumulated
+                // independently in unconstrained space.
                 atomicAdd(&(u_mppi[ctrl_idx].a), (a_candidate_z - a_nom_z) * weight_normalized);
                 atomicAdd(&(u_mppi[ctrl_idx].delta), (delta_candidate_z - delta_nom_z) * weight_normalized);
             }
@@ -2290,8 +2337,10 @@ class MPPI:
         self.vehicle_length = float(vehicle_length)
         self.vehicle_width = float(vehicle_width)
         self.dynamics_type = str(dynamics_type).strip().lower()
-        if self.dynamics_type not in {"ackermann", "holonomic"}:
-            raise ValueError("dynamics_type must be 'ackermann' or 'holonomic'")
+        if self.dynamics_type not in {"ackermann", "holonomic", "skidsteer"}:
+            raise ValueError(
+                "dynamics_type must be 'ackermann', 'holonomic', or 'skidsteer'"
+            )
         self.dynamic_clearance_margin = float(dynamic_clearance_margin)
         self.dynamic_clearance_weight = float(dynamic_clearance_weight)
         self.dynamic_collision_cost = float(dynamic_collision_cost)
@@ -2345,8 +2394,9 @@ class MPPI:
         self.optimization_args["static_clearance_weight"] = np.float32(
             self.static_clearance_weight
         )
+        dynamics_ids = {"ackermann": 0, "holonomic": 1, "skidsteer": 2}
         self.optimization_args["dynamics_type"] = np.int32(
-            1 if self.dynamics_type == "holonomic" else 0
+            dynamics_ids[self.dynamics_type]
         )
         self.optimization_args["holonomic_max_heading_change"] = np.float32(
             holonomic_max_heading_change
@@ -3030,8 +3080,9 @@ class MPPI:
                         self.last_dynamic_filter_all_invalid = True
                         record_timing("dynamic_weight_filter_restore")
 
-                # Accumulate weighted disturbances in unconstrained control space.
-                # This avoids biasing saturated steering commands back toward zero.
+                # Accumulate bounded scalar controls (Ackermann and skid-steer)
+                # independently in unconstrained space. This avoids biasing a
+                # saturated steering or yaw-rate command back toward zero.
                 u_limits_host = self.optimization_args["u_limits"][0]
                 if self.dynamics_type == "holonomic":
                     u_nom_z_host = u_nom_host.copy()

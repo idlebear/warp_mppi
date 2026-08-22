@@ -3129,6 +3129,7 @@ extern "C" {
         float origin_y,
         float resolution,
         int ego_state_stride,
+        int ego_heading_index,
         float sensor_range,
         float sensor_fov
     ) {
@@ -3158,7 +3159,10 @@ extern "C" {
                 ego_states + (traj_idx * horizon + step_idx) * ego_state_stride;
             float observer_x = ego_state[0];
             float observer_y = ego_state[1];
-            float observer_heading = ego_state_stride > 2 ? ego_state[2] : 0.0f;
+            float observer_heading =
+                ego_heading_index >= 0 && ego_heading_index < ego_state_stride
+                ? ego_state[ego_heading_index]
+                : 0.0f;
 
             int cells_x[MAX_FOOTPRINT_CELLS];
             int cells_y[MAX_FOOTPRINT_CELLS];
@@ -4476,9 +4480,18 @@ def pack_rollout_states(trajectories, prediction_length, steps_per_prediction):
 
 
 def build_canonical_entropy_inputs_from_scene(
-    scene, num_trajectories=None, trajectory_states=None
+    scene,
+    num_trajectories=None,
+    trajectory_states=None,
+    trajectory_heading_index=None,
 ):
-    """Combine a reusable OCE scene payload with ego trajectory states."""
+    """Combine a reusable OCE scene payload with ego trajectory states.
+
+    Packed geometric trajectories use ``[x, y, heading]`` and therefore
+    heading index 2.  Four-value MPPI rollouts use ``[x, y, speed, heading]``
+    and therefore heading index 3.  ``trajectory_heading_index`` is available
+    for callers with another explicit layout.
+    """
 
     if not isinstance(scene, OCESceneInputs):
         raise TypeError("scene must be an OCESceneInputs instance")
@@ -4502,7 +4515,23 @@ def build_canonical_entropy_inputs_from_scene(
             "trajectory_states horizon is shorter than the scene prediction length"
         )
 
-    traj_np = traj_np[:, : scene.prediction_length, :EGO_STATE_DIM]
+    if trajectory_states is not None:
+        if trajectory_heading_index is None:
+            trajectory_heading_index = 3 if traj_np.shape[2] >= 4 else 2
+        trajectory_heading_index = int(trajectory_heading_index)
+        if not 0 <= trajectory_heading_index < traj_np.shape[2]:
+            raise ValueError("trajectory_heading_index is outside the state layout")
+        canonical_states = np.empty(
+            (traj_np.shape[0], scene.prediction_length, EGO_STATE_DIM),
+            dtype=np.float32,
+        )
+        canonical_states[:, :, 0:2] = traj_np[:, : scene.prediction_length, 0:2]
+        canonical_states[:, :, 2] = traj_np[
+            :, : scene.prediction_length, trajectory_heading_index
+        ]
+        traj_np = np.ascontiguousarray(canonical_states)
+    else:
+        traj_np = traj_np[:, : scene.prediction_length, :EGO_STATE_DIM]
     num_trajectories = int(traj_np.shape[0])
 
     return CanonicalEntropyInputs(
@@ -5332,8 +5361,13 @@ def _compute_sensor_gate_tensor_cuda(
     sensor_fov,
     cuda_cache,
     ego_state_stride=EGO_STATE_DIM,
+    ego_heading_index=None,
 ):
-    """Compute per-(trajectory, step, mode) sensor coverage fractions on CUDA."""
+    """Compute per-(trajectory, step, mode) sensor coverage fractions on CUDA.
+
+    The default heading field is index 2 for packed paths and index 3 for the
+    four-value MPPI state layout, preventing speed from being used as heading.
+    """
     if not isinstance(scene, OCESceneInputs):
         raise TypeError("scene must be an OCESceneInputs instance")
 
@@ -5352,6 +5386,13 @@ def _compute_sensor_gate_tensor_cuda(
 
     num_trajectories = int(num_trajectories)
     ego_state_stride = int(ego_state_stride)
+    if ego_heading_index is None:
+        ego_heading_index = (
+            3 if ego_state_stride >= 4 else (2 if ego_state_stride >= 3 else -1)
+        )
+    ego_heading_index = int(ego_heading_index)
+    if ego_heading_index < -1 or ego_heading_index >= ego_state_stride:
+        raise ValueError("ego_heading_index is outside the ego state layout")
     horizon = int(scene.prediction_length)
     total_modes = int(scene.num_modes_total)
     num_targets = int(scene.num_targets)
@@ -5403,6 +5444,7 @@ def _compute_sensor_gate_tensor_cuda(
         np.float32(scene.origin[1]),
         np.float32(scene.resolution),
         np.int32(ego_state_stride),
+        np.int32(ego_heading_index),
         np.float32(sensor_range),
         np.float32(sensor_fov),
         block=(block_items, 1, 1),
@@ -5596,6 +5638,7 @@ def _score_oce_scene_rollouts_gpu_impl(
         scene=scene,
         num_trajectories=rollout_states.shape[0],
         trajectory_states=rollout_states,
+        trajectory_heading_index=3 if rollout_states.shape[2] >= 4 else 2,
     )
 
     if cuda_cache is None:
@@ -5735,6 +5778,9 @@ def _score_visibility_timeline_gpu_impl(
         sensor_fov=float(sensor_fov),
         cuda_cache=cuda_cache,
         ego_state_stride=rollout_state_stride,
+        ego_heading_index=(
+            3 if rollout_state_stride >= 4 else (2 if rollout_state_stride >= 3 else -1)
+        ),
     )
 
     visibility_tensor = _copy_visibility_like_tensor_from_device(
