@@ -116,21 +116,38 @@ def _active_cuda_context(context=None):
         context.pop()
 
 
-def _cleanup_context_atexit():
-    global _MODULE_CONTEXT, _owns_module_context_ref, _module_context_pushed
-    if _owns_module_context_ref and _MODULE_CONTEXT is not None:
+def _drain_current_context_stack():
+    """Pop leaked contexts on the dedicated CUDA-owning worker thread."""
+    if not _PYCUDA_AVAILABLE:
+        return
+    for _ in range(64):
         try:
-            if _module_context_pushed:
-                _MODULE_CONTEXT.pop()
-                _module_context_pushed = False
-            _MODULE_CONTEXT.detach()
-            _MODULE_CONTEXT = None
-            _owns_module_context_ref = False
+            if _cuda.Context.get_current() is None:
+                return
+            _cuda.Context.pop()
         except Exception:
-            pass
+            return
 
 
-atexit.register(_cleanup_context_atexit)
+def close_trajectory_eval_cuda():
+    global _MODULE_CONTEXT, _owns_module_context_ref, _module_context_pushed
+    context = _MODULE_CONTEXT
+    if context is None:
+        return
+    try:
+        _drain_current_context_stack()
+        _module_context_pushed = False
+        if _owns_module_context_ref:
+            context.detach()
+    except Exception:
+        pass
+    finally:
+        _MODULE_CONTEXT = None
+        _owns_module_context_ref = False
+        _module_context_pushed = False
+
+
+atexit.register(close_trajectory_eval_cuda)
 
 
 def _read_nonnegative_env_float(name, default):

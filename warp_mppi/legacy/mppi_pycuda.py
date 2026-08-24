@@ -15,14 +15,22 @@ import sys
 from typing import Any
 
 try:
-    from .trajectory_eval_pycuda import score_oce_scene_rollouts_device
+    from .trajectory_eval_pycuda import (
+        close_trajectory_eval_cuda,
+        score_oce_scene_rollouts_device,
+    )
 except Exception as _oce_import_error:  # pragma: no cover - optional OCE path
     score_oce_scene_rollouts_device = None
+    close_trajectory_eval_cuda = None
 
 try:
-    from .discrete_oce_pycuda import evaluate_discrete_oce_rollouts_gpu
+    from .discrete_oce_pycuda import (
+        close_discrete_oce_cuda,
+        evaluate_discrete_oce_rollouts_gpu,
+    )
 except Exception as _discrete_oce_import_error:  # pragma: no cover - optional OCE path
     evaluate_discrete_oce_rollouts_gpu = None
+    close_discrete_oce_cuda = None
 
 
 _cuda: Any = cuda  # alias to satisfy static analyzers
@@ -92,31 +100,43 @@ def _active_cuda_context(context):
         context.pop()
 
 
-def _cleanup_context_atexit():
+def _drain_current_context_stack():
+    """Pop leaked contexts on the dedicated CUDA-owning worker thread."""
+    for _ in range(64):
+        try:
+            if _cuda.Context.get_current() is None:
+                return
+            _cuda.Context.pop()
+        except Exception:
+            return
+
+
+def close_mppi_cuda_context():
     """
     Registered with atexit. Releases the CUDA context reference owned by this
     module, if this module retained or created one at import time.
     """
     global _MODULE_CONTEXT, _owns_module_context_ref, _module_context_pushed
-    if _owns_module_context_ref and _MODULE_CONTEXT is not None:
-        try:
-            if _module_context_pushed:
-                _MODULE_CONTEXT.pop()
-                _module_context_pushed = False
+    context = _MODULE_CONTEXT
+    if context is None:
+        return
+    try:
+        _drain_current_context_stack()
+        _module_context_pushed = False
+        if _owns_module_context_ref:
+            context.detach()  # Release/destroy the retained context
+    except cuda.Error:
+        # CUDA may already be deinitialized when invoked by atexit.
+        pass
+    except Exception:
+        pass
+    finally:
+        _MODULE_CONTEXT = None
+        _owns_module_context_ref = False
+        _module_context_pushed = False
 
-            _MODULE_CONTEXT.detach()  # Release/destroy the retained context
 
-            _MODULE_CONTEXT = None
-            _owns_module_context_ref = False
-        except cuda.Error:
-            # Suppress errors during atexit cleanup (e.g., if context was already destroyed)
-            pass
-        except Exception:
-            # Suppress any other unexpected errors during atexit cleanup
-            pass
-
-
-atexit.register(_cleanup_context_atexit)
+atexit.register(close_mppi_cuda_context)
 # --- End CUDA Context Management ---
 
 
@@ -353,14 +373,8 @@ def _prepare_occupancy_grid_stack(occupancy_grids):
 
 
 def _prepare_rollout_obstacle_batches(obstacles, horizon, occupancy_payload=None):
-    if occupancy_payload is not None:
-        return (
-            np.zeros((0, 2), dtype=np.float32),
-            np.zeros((0, 4), dtype=np.float32),
-            [],
-            np.zeros((0,), dtype=np.float32),
-            np.zeros((1,), dtype=np.int32),
-        )
+    # The raster accelerates static collision queries, but it does not replace
+    # exact polygons or moving actors (notably the tracked target).
     return _prepare_obstacle_batches(obstacles, horizon)
 
 
@@ -461,19 +475,31 @@ def _compact_csr_state_space(
     transition_indptr,
     max_states=None,
     probability_floor=0.0,
+    support_beliefs=None,
+    selected_state_indices=None,
 ):
     """Reduce discrete OCE to high-probability states before rollout scoring.
 
-    The full transition grid can be thousands of states.  MPPI rollout scoring
-    only needs a relative OCE cost, so we keep the states that are plausible
-    over the evaluated horizon and renormalize the induced transition rows.
+    The full transition grid can be thousands of states. Keep every state whose
+    propagated mass reaches the configured support threshold at any base or
+    observation stage, then renormalize the induced transition rows.
     """
     max_states = None if max_states is None else int(max_states)
     probability_floor = float(probability_floor or 0.0)
     num_states = int(np.asarray(state_centers).shape[0])
     if max_states is not None and max_states <= 0:
         max_states = None
-    if (max_states is None or max_states >= num_states) and probability_floor <= 0.0:
+    explicit_selection = selected_state_indices is not None
+    if explicit_selection:
+        requested = np.asarray(selected_state_indices, dtype=np.int64).reshape(-1)
+        if requested.size == 0:
+            raise ValueError("selected_state_indices must not be empty")
+        if np.any(requested < 0) or np.any(requested >= num_states):
+            raise ValueError("selected_state_indices contains an out-of-range state")
+        if np.unique(requested).size != requested.size:
+            raise ValueError("selected_state_indices must be unique")
+        selected = np.sort(requested)
+    elif (max_states is None or max_states >= num_states) and probability_floor <= 0.0:
         return {
             "state_centers": state_centers,
             "beliefs": beliefs,
@@ -486,17 +512,25 @@ def _compact_csr_state_space(
         }
 
     prefix = np.asarray(prefix_beliefs, dtype=np.float32)
-    scores = np.max(prefix, axis=(0, 1))
-    if probability_floor > 0.0:
-        selected = np.flatnonzero(scores >= probability_floor)
-    else:
-        selected = np.arange(num_states, dtype=np.int64)
-    if selected.size == 0:
-        selected = np.asarray([int(np.argmax(scores))], dtype=np.int64)
-    if max_states is not None and selected.size > max_states:
-        selected = np.argsort(scores)[-max_states:]
-    selected = np.asarray(np.unique(selected), dtype=np.int64)
-    selected.sort()
+    if not explicit_selection:
+        support = (
+            prefix
+            if support_beliefs is None
+            else np.asarray(support_beliefs, dtype=np.float32)
+        )
+        scores = np.max(support, axis=tuple(range(support.ndim - 1)))
+        if probability_floor > 0.0:
+            selected = np.flatnonzero(scores >= probability_floor)
+        else:
+            selected = np.arange(num_states, dtype=np.int64)
+        if selected.size == 0:
+            selected = np.asarray([int(np.argmax(scores))], dtype=np.int64)
+        if max_states is not None and selected.size > max_states:
+            state_ids = np.arange(num_states, dtype=np.int64)
+            order = np.lexsort((state_ids, -scores))
+            selected = order[:max_states]
+        selected = np.asarray(np.unique(selected), dtype=np.int64)
+        selected.sort()
 
     old_to_new = np.full((num_states,), -1, dtype=np.int32)
     old_to_new[selected] = np.arange(selected.size, dtype=np.int32)
@@ -564,29 +598,44 @@ def _compact_csr_state_space(
 
 def _prepare_discrete_oce_rollout_inputs(oce_payload, horizon):
     tracker = oce_payload.get("tracker")
-    if tracker is None:
-        raise ValueError("discrete oce_data requires a tracker")
-    if not getattr(tracker, "agent_hmms", None):
-        return None
-
     eval_horizon = max(1, int(oce_payload.get("horizon", horizon)))
-    agent_ids, beliefs = tracker.agent_belief_matrix()
-    if len(agent_ids) == 0:
-        return None
+    if tracker is None:
+        required = (
+            "beliefs", "prefix_beliefs", "state_centers", "transition_data",
+            "transition_indices", "transition_indptr", "static_grid",
+        )
+        missing = [key for key in required if key not in oce_payload]
+        if missing:
+            raise ValueError(
+                "direct discrete oce_data is missing: " + ", ".join(missing)
+            )
+        beliefs = np.asarray(oce_payload["beliefs"], dtype=np.float32)
+        prefix_beliefs = np.asarray(oce_payload["prefix_beliefs"], dtype=np.float32)
+        state_centers = np.asarray(oce_payload["state_centers"], dtype=np.float32)
+        transition_data = np.asarray(oce_payload["transition_data"], dtype=np.float32)
+        transition_indices = np.asarray(oce_payload["transition_indices"], dtype=np.int32)
+        transition_indptr = np.asarray(oce_payload["transition_indptr"], dtype=np.int32)
+        agent_ids = tuple(range(int(beliefs.shape[0])))
+    else:
+        if not getattr(tracker, "agent_hmms", None):
+            return None
+        agent_ids, beliefs = tracker.agent_belief_matrix()
+        if len(agent_ids) == 0:
+            return None
+        (
+            transition_data,
+            transition_indices,
+            transition_indptr,
+            prefix_beliefs,
+        ) = tracker.agent_mixed_transition_csr(agent_ids, eval_horizon)
+        state_centers = np.asarray(tracker.state_centers_sim, dtype=np.float32)
 
-    (
-        transition_data,
-        transition_indices,
-        transition_indptr,
-        prefix_beliefs,
-    ) = tracker.agent_mixed_transition_csr(agent_ids, eval_horizon)
-    state_centers = np.asarray(tracker.state_centers_sim, dtype=np.float32)
-    max_states = oce_payload.get("max_states", oce_payload.get("state_limit", 384))
+    max_states = oce_payload.get("max_states", oce_payload.get("state_limit"))
     if max_states is not None and int(max_states) <= 0:
         max_states = None
-        probability_floor = 0.0
-    else:
-        probability_floor = float(oce_payload.get("state_probability_floor", 1.0e-4))
+    probability_floor = float(oce_payload.get("state_probability_floor", 1.0e-12))
+    if probability_floor < 0.0:
+        raise ValueError("state_probability_floor must be non-negative")
     compacted = _compact_csr_state_space(
         state_centers=state_centers,
         beliefs=np.asarray(beliefs, dtype=np.float32),
@@ -596,7 +645,27 @@ def _prepare_discrete_oce_rollout_inputs(oce_payload, horizon):
         transition_indptr=np.asarray(transition_indptr, dtype=np.int32),
         max_states=max_states,
         probability_floor=probability_floor,
+        support_beliefs=oce_payload.get("support_beliefs"),
+        selected_state_indices=oce_payload.get("selected_state_indices"),
     )
+    visibility_group_ids = oce_payload.get("visibility_group_ids")
+    if visibility_group_ids is None:
+        visibility_representatives = np.arange(
+            compacted["state_centers"].shape[0], dtype=np.int32
+        )
+    else:
+        visibility_group_ids = np.asarray(visibility_group_ids).reshape(-1)
+        if visibility_group_ids.shape != (state_centers.shape[0],):
+            raise ValueError(
+                "visibility_group_ids must contain one group for every target state"
+            )
+        selected_groups = visibility_group_ids[compacted["state_indices"]]
+        _groups, first_indices, inverse = np.unique(
+            selected_groups, return_index=True, return_inverse=True
+        )
+        visibility_representatives = np.ascontiguousarray(
+            first_indices[inverse], dtype=np.int32
+        )
 
     occupancy_horizon = oce_payload.get("occupancy_horizon")
     agent_owner_bits = np.zeros((len(agent_ids),), dtype=np.uint64)
@@ -616,7 +685,7 @@ def _prepare_discrete_oce_rollout_inputs(oce_payload, horizon):
         occupancy_probability_grids = occupancy_horizon.probability_grids
         occupancy_owner_mask_grids = occupancy_horizon.owner_mask_grids
         occupancy_threshold = getattr(occupancy_horizon, "visibility_threshold", 0.25)
-    else:
+    elif tracker is not None:
         static_grid = tracker.static_occupancy_grid
         grid_origin = (
             float(tracker.bounds["min_x"]),
@@ -625,6 +694,13 @@ def _prepare_discrete_oce_rollout_inputs(oce_payload, horizon):
         grid_resolution = tracker.cell_size
         occupancy_probability_grids = None
         occupancy_owner_mask_grids = None
+        occupancy_threshold = float(oce_payload.get("occupancy_threshold", 0.25))
+    else:
+        static_grid = np.asarray(oce_payload["static_grid"], dtype=np.uint8)
+        grid_origin = oce_payload.get("grid_origin", (0.0, 0.0))
+        grid_resolution = float(oce_payload.get("grid_resolution", 1.0))
+        occupancy_probability_grids = oce_payload.get("occupancy_probability_grids")
+        occupancy_owner_mask_grids = oce_payload.get("occupancy_owner_mask_grids")
         occupancy_threshold = float(oce_payload.get("occupancy_threshold", 0.25))
 
     return {
@@ -645,6 +721,17 @@ def _prepare_discrete_oce_rollout_inputs(oce_payload, horizon):
         "occupancy_owner_mask_grids": occupancy_owner_mask_grids,
         "agent_owner_bits": agent_owner_bits,
         "occupancy_threshold": float(occupancy_threshold),
+        "field_of_view_degrees": float(oce_payload.get("field_of_view_degrees", 360.0)),
+        "next_sensor_step": int(oce_payload.get("next_sensor_step", 0)),
+        "sensing_interval": int(oce_payload.get("sensing_interval", 1)),
+        "planning_speed": int(oce_payload.get("planning_speed", 1)),
+        "rollout_step_stride": int(oce_payload.get("rollout_step_stride", 1)),
+        "transition_steps": oce_payload.get("transition_steps"),
+        "visibility_representatives": visibility_representatives,
+        "terminal_occluded_only": bool(
+            oce_payload.get("terminal_occluded_only", False)
+        ),
+        "scoring_mode": str(oce_payload.get("scoring_mode", "entropy")),
         "state_indices": compacted["state_indices"],
         "state_reduction": {
             "enabled": bool(compacted["reduced"]),
@@ -652,6 +739,12 @@ def _prepare_discrete_oce_rollout_inputs(oce_payload, horizon):
             "selected_states": int(compacted["state_centers"].shape[0]),
             "max_states": None if max_states is None else int(max_states),
             "probability_floor": float(probability_floor),
+            "selection_mode": (
+                "explicit_horizon_envelope"
+                if oce_payload.get("selected_state_indices") is not None
+                else "legacy_probability_support"
+            ),
+            "belief_support": oce_payload.get("belief_support"),
         },
     }
 
@@ -875,6 +968,7 @@ _MPPI_CUDA_SOURCE = """
         int dynamics_type; // 0=Ackermann, 1=holonomic, 2=skid-steer
         float holonomic_max_heading_change;
         float holonomic_max_curvature;
+        float full_control_exploration_fraction;
     };
 
     struct Obstacle {
@@ -1569,20 +1663,37 @@ _MPPI_CUDA_SOURCE = """
             const float *u_limits,
             const float *u_dist_limits,
             int dynamics_type,
+            int samples,
+            float full_control_exploration_fraction,
             Control *u_dist
     ) {
       curandState localState = globalState[index];
             for (int i = 0; i < num_controls; i++) {
+                if (index == 0) {
+                    u_dist[i].a = 0.0f;
+                    u_dist[i].delta = 0.0f;
+                    continue;
+                }
                 // Sample in unconstrained squashed-control coordinates:
                 //   u = limit * tanh(z)
                 // This avoids the boundary bias caused by clipping sampled controls
                 // and then averaging the clipped disturbances in control space.
-                float a_z_nom = unsquash_control(u_nom[i].a, u_limits[0]);
-                float delta_z_nom = unsquash_control(u_nom[i].delta, u_limits[1]);
-                float a_z_noise = curand_normal(&localState) * (u_dist_limits[0] / fmaxf(u_limits[0], FLT_EPSILON));
-                float delta_z_noise = curand_normal(&localState) * (u_dist_limits[1] / fmaxf(u_limits[1], FLT_EPSILON));
-                float a_candidate = squash_control(a_z_nom + a_z_noise, u_limits[0]);
-                float delta_candidate = squash_control(delta_z_nom + delta_z_noise, u_limits[1]);
+                int exploration_samples = (int)ceilf(
+                    full_control_exploration_fraction * (float)samples
+                );
+                float a_candidate;
+                float delta_candidate;
+                if (index <= exploration_samples) {
+                    a_candidate = (2.0f * curand_uniform(&localState) - 1.0f) * u_limits[0];
+                    delta_candidate = (2.0f * curand_uniform(&localState) - 1.0f) * u_limits[1];
+                } else {
+                    float a_z_nom = unsquash_control(u_nom[i].a, u_limits[0]);
+                    float delta_z_nom = unsquash_control(u_nom[i].delta, u_limits[1]);
+                    float a_z_noise = curand_normal(&localState) * (u_dist_limits[0] / fmaxf(u_limits[0], FLT_EPSILON));
+                    float delta_z_noise = curand_normal(&localState) * (u_dist_limits[1] / fmaxf(u_limits[1], FLT_EPSILON));
+                    a_candidate = squash_control(a_z_nom + a_z_noise, u_limits[0]);
+                    delta_candidate = squash_control(delta_z_nom + delta_z_noise, u_limits[1]);
+                }
                 if (dynamics_type == 1) {
                     float magnitude = hypotf(a_candidate, delta_candidate);
                     float max_speed = fmaxf(u_limits[0], 0.0f);
@@ -1662,7 +1773,12 @@ _MPPI_CUDA_SOURCE = """
             const State *x_goal_state = reinterpret_cast<const State *>(optimization_args->x_goal);
             Control *u_dist_controls = reinterpret_cast<Control *>(&u_dists[sample_index * num_controls]);
 
-            generate_controls(globalState, sample_index, u_nom, num_controls, u_limits, u_dist_limits, optimization_args->dynamics_type, u_dist_controls);
+            generate_controls(
+                globalState, sample_index, u_nom, num_controls, u_limits,
+                u_dist_limits, optimization_args->dynamics_type, samples,
+                optimization_args->full_control_exploration_fraction,
+                u_dist_controls
+            );
 
             State current_state = {x_init_state->x, x_init_state->y, x_init_state->v, x_init_state->theta};
             State state_step = {0, 0, 0, 0};
@@ -1724,7 +1840,7 @@ _MPPI_CUDA_SOURCE = """
                               (c.delta - u_nom[i - 1].delta) * R[1] * (c.delta - u_nom[i - 1].delta);
 
                 // optional steering rate penalty (difference between successive applied steering commands)
-                if (optimization_args->dynamics_type == 0 && optimization_args->steering_rate_weight > 0.0f && i > 1) {
+                if (optimization_args->dynamics_type != 1 && optimization_args->steering_rate_weight > 0.0f && i > 1) {
                     float prev_delta = u_nom[i - 2].delta + u_dist_controls[i - 2].delta; // previous applied delta
                     float rate = c.delta - prev_delta; // instantaneous change (already per-step)
                     control_err += optimization_args->steering_rate_weight * rate * rate;
@@ -1991,6 +2107,124 @@ _MPPI_CUDA_SOURCE = """
     }
 
     extern "C" __global__
+    void add_scaled_sample_costs(
+            float *sample_costs,
+            const float *extra_costs,
+            float scale,
+            int samples
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            sample_costs[sample_index] += scale * extra_costs[sample_index];
+        }
+    }
+
+    extern "C" __global__
+    void add_distance_costs(
+            const State *rollout_states,
+            const float *target_means,
+            int samples,
+            int num_controls,
+            float desired_distance,
+            float scale,
+            float inside_multiplier,
+            float terminal_multiplier,
+            float current_distance,
+            float inside_escape_penalty,
+            float *distance_costs,
+            float *sample_costs
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            float cost = 0.0f;
+            float previous_distance = current_distance;
+            for (int step = 0; step < num_controls; ++step) {
+                State state = rollout_states[sample_index * num_controls + step];
+                float dx = state.x - target_means[step * 2 + 0];
+                float dy = state.y - target_means[step * 2 + 1];
+                float distance = hypotf(dx, dy);
+                float error = distance - desired_distance;
+                float multiplier = error < 0.0f ? inside_multiplier : 1.0f;
+                cost += scale * multiplier * error * error;
+                if (
+                    inside_escape_penalty > 0.0f
+                    && previous_distance < desired_distance
+                    && distance < previous_distance - 1.0e-5f
+                ) {
+                    cost += inside_escape_penalty;
+                }
+                if (step == num_controls - 1) {
+                    cost += scale * (float)num_controls * terminal_multiplier
+                        * multiplier * error * error;
+                }
+                previous_distance = distance;
+            }
+            distance_costs[sample_index] = cost;
+            sample_costs[sample_index] += cost;
+        }
+    }
+
+    extern "C" __global__
+    void compute_fov_centering_costs(
+            const State *rollout_states,
+            const float *target_means,
+            int samples,
+            int num_controls,
+            float half_fov_radians,
+            float scale,
+            float *visibility_costs
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+        float denominator = fmaxf(half_fov_radians * half_fov_radians, 1.0e-8f);
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            float cost = 0.0f;
+            for (int step = 0; step < num_controls; ++step) {
+                State state = rollout_states[sample_index * num_controls + step];
+                float bearing = atan2f(
+                    target_means[step * 2 + 1] - state.y,
+                    target_means[step * 2 + 0] - state.x
+                );
+                float error = wrap_angle(bearing - state.theta);
+                cost += scale * error * error / denominator;
+            }
+            visibility_costs[sample_index] = cost;
+        }
+    }
+
+    extern "C" __global__
+    void add_skidsteer_control_costs(
+            const Control *u_nom,
+            const Control *u_dists,
+            int samples,
+            int num_controls,
+            float linear_scale,
+            float yaw_scale,
+            float yaw_slew_scale,
+            float *component_costs,
+            float *sample_costs
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            float cost = 0.0f;
+            float previous_yaw_rate = 0.0f;
+            for (int step = 0; step < num_controls; ++step) {
+                int index = sample_index * num_controls + step;
+                float linear_velocity = u_nom[step].a + u_dists[index].a;
+                float yaw_rate = u_nom[step].delta + u_dists[index].delta;
+                float yaw_slew = yaw_rate - previous_yaw_rate;
+                cost += linear_scale * linear_velocity * linear_velocity;
+                cost += yaw_scale * yaw_rate * yaw_rate;
+                cost += yaw_slew_scale * yaw_slew * yaw_slew;
+                previous_yaw_rate = yaw_rate;
+            }
+            sample_costs[sample_index] += cost;
+            if (component_costs != NULL) {
+                component_costs[sample_index * 5 + 1] += cost;
+            }
+        }
+    }
+
+    extern "C" __global__
     void min_weight(
         int samples,
         float *u_weights,
@@ -2025,6 +2259,90 @@ _MPPI_CUDA_SOURCE = """
             // Thus, only thread 0 of this single block will write to u_weight_min.
             // A direct write is safe and avoids issues with atomicMin for floats.
             *u_weight_min = shared_min[0];
+        }
+    }
+
+    extern "C" __global__
+    void reduce_objective_components(
+            int samples,
+            const float *component_costs,
+            const float *oce_costs,
+            const float *distance_costs,
+            const float *visibility_costs,
+            const float *dynamic_costs,
+            const float *occupancy_costs,
+            float nominal_scale,
+            float ring_scale,
+            float toe_scale,
+            float *component_means
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+        float inverse_samples = samples > 0 ? 1.0f / (float)samples : 0.0f;
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            int component_base = sample_index * 5;
+            float nominal = component_costs != NULL ? nominal_scale * component_costs[component_base + 0] : 0.0f;
+            float toe = oce_costs != NULL ? toe_scale * oce_costs[sample_index] : 0.0f;
+            float distance = distance_costs != NULL ? distance_costs[sample_index] : 0.0f;
+            float ring = component_costs != NULL ? ring_scale * component_costs[component_base + 0] : 0.0f;
+            float visibility = visibility_costs != NULL ? visibility_costs[sample_index] : 0.0f;
+            float mppi = 0.0f;
+            if (component_costs != NULL) {
+                mppi += component_costs[component_base + 1];
+                mppi += component_costs[component_base + 2];
+                mppi += component_costs[component_base + 3];
+            }
+            if (dynamic_costs != NULL) mppi += dynamic_costs[sample_index];
+            if (occupancy_costs != NULL) mppi += occupancy_costs[sample_index];
+            atomicAdd(&component_means[0], nominal * inverse_samples);
+            atomicAdd(&component_means[1], toe * inverse_samples);
+            atomicAdd(&component_means[2], distance * inverse_samples);
+            atomicAdd(&component_means[3], ring * inverse_samples);
+            atomicAdd(&component_means[4], visibility * inverse_samples);
+            atomicAdd(&component_means[5], mppi * inverse_samples);
+        }
+    }
+
+    extern "C" __global__
+    void combine_phase2_objective(
+            int samples,
+            const float *component_costs,
+            const float *oce_costs,
+            const float *distance_costs,
+            const float *visibility_costs,
+            const float *dynamic_costs,
+            const float *occupancy_costs,
+            float nominal_scale,
+            float ring_scale,
+            float toe_scale,
+            float *sample_costs
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            int component_base = sample_index * 5;
+            float nominal = nominal_scale * component_costs[component_base + 0];
+            float ring = ring_scale * component_costs[component_base + 0];
+            float mppi = component_costs[component_base + 1]
+                + component_costs[component_base + 2]
+                + component_costs[component_base + 3];
+            if (dynamic_costs != NULL) mppi += dynamic_costs[sample_index];
+            if (occupancy_costs != NULL) mppi += occupancy_costs[sample_index];
+            float distance = distance_costs != NULL ? distance_costs[sample_index] : 0.0f;
+            float toe = oce_costs != NULL ? toe_scale * oce_costs[sample_index] : 0.0f;
+            float visibility = visibility_costs != NULL ? visibility_costs[sample_index] : 0.0f;
+            sample_costs[sample_index] = nominal + toe + distance + ring + visibility + mppi;
+        }
+    }
+
+    extern "C" __global__
+    void reduce_weight_squares(
+            int samples,
+            const float *weights,
+            float *weight_square_sum
+    ) {
+        int start_sample_index = blockIdx.x * blockDim.x + threadIdx.x;
+        for (int sample_index = start_sample_index; sample_index < samples; sample_index += blockDim.x * gridDim.x) {
+            float weight = weights[sample_index];
+            atomicAdd(weight_square_sum, weight * weight);
         }
     }
 
@@ -2281,6 +2599,7 @@ class MPPI:
             ("dynamics_type", np.int32),
             ("holonomic_max_heading_change", np.float32),
             ("holonomic_max_curvature", np.float32),
+            ("full_control_exploration_fraction", np.float32),
         ]
     )
 
@@ -2322,6 +2641,7 @@ class MPPI:
         dynamics_type="ackermann",
         holonomic_max_heading_change=0.0,
         holonomic_max_curvature=0.0,
+        full_control_exploration_fraction=0.0,
     ):
         """Initialize MPPI controller.
 
@@ -2404,6 +2724,11 @@ class MPPI:
         self.optimization_args["holonomic_max_curvature"] = np.float32(
             holonomic_max_curvature
         )
+        if not 0.0 <= float(full_control_exploration_fraction) < 1.0:
+            raise ValueError("full_control_exploration_fraction must be in [0, 1)")
+        self.optimization_args["full_control_exploration_fraction"] = np.float32(
+            full_control_exploration_fraction
+        )
 
         # Allocate GPU buffers inside context
         with _active_cuda_context(self.mppi_context):
@@ -2442,6 +2767,7 @@ class MPPI:
         self.last_oce_costs = None
         self.last_rollout_costs = None
         self.last_cost_components = None
+        self.last_cost_component_means = None
         self.last_dynamic_costs = None
         self.last_dynamic_clearance_summary = None
         self.last_dynamic_actor_debug = None
@@ -2462,6 +2788,53 @@ class MPPI:
                 f"static_hard_clearance_margin={static_hard_clearance_margin} "
                 f"static_clearance_margin={static_clearance_margin} "
                 f"static_clearance_weight={static_clearance_weight}"
+            )
+
+    def close(self) -> None:
+        """Release controller allocations while leaving the module context reusable.
+
+        The retained primary-context reference is module-scoped because the
+        compiled kernels belong to it. Detaching it after every controller
+        makes a second MPPI instance in the same process unusable. The context
+        is never left current here and its retained reference is released by
+        the registered module-level atexit handler.
+        """
+        context = getattr(self, "mppi_context", None)
+        if context is None:
+            return
+        with _active_cuda_context(context):
+            _cuda.Context.synchronize()
+            self.last_oce_result = None
+            for name in (
+                "optimization_args_gpu",
+                "costmap_args_gpu",
+                "globalState_gpu",
+            ):
+                buffer = getattr(self, name, None)
+                if buffer is not None:
+                    try:
+                        buffer.free()
+                    except Exception:
+                        pass
+                    finally:
+                        setattr(self, name, None)
+            _cuda_buffer_cache.release()
+        self.mppi_context = None
+        if close_discrete_oce_cuda is not None:
+            close_discrete_oce_cuda()
+        if close_trajectory_eval_cuda is not None:
+            close_trajectory_eval_cuda()
+
+    def set_seed(self, seed: int) -> None:
+        """Reset rollout RNG states for a timestamp-derived deterministic solve."""
+        block_cfg = (BLOCK_SIZE, 1, 1)
+        grid_dim_x = max(1, int((self.samples + block_cfg[0] - 1) / block_cfg[0]))
+        with _active_cuda_context(self.mppi_context):
+            _COMPILED_MODULE.get_function("setup_kernel")(
+                self.globalState_gpu,
+                np.uint32(seed),
+                block=block_cfg,
+                grid=(grid_dim_x, 1),
             )
 
     def set_steering_limit(self, max_steer_rad: float):
@@ -2495,6 +2868,7 @@ class MPPI:
         dt,
         oce_data=None,
         occupancy_grids=None,
+        objective_data=None,
     ):
         if self.mppi_context is None:
             raise RuntimeError("MPPI has no CUDA context")
@@ -2515,11 +2889,19 @@ class MPPI:
             timing_last = now
 
         # Host-side outputs
-        u_mppi_host = np.zeros_like(u_nom, dtype=np.float32)
-        u_dist_host_reshaped = np.zeros(
-            (self.samples, u_nom.shape[0], u_nom.shape[1]), dtype=np.float32
+        materialize_rollout_diagnostics = bool(
+            objective_data is None
+            or objective_data.get("materialize_rollout_diagnostics", True)
         )
-        u_weights_host = np.zeros(self.samples, dtype=np.float32)
+        u_mppi_host = np.zeros_like(u_nom, dtype=np.float32)
+        if materialize_rollout_diagnostics:
+            u_dist_host_reshaped = np.zeros(
+                (self.samples, u_nom.shape[0], u_nom.shape[1]), dtype=np.float32
+            )
+            u_weights_host = np.zeros(self.samples, dtype=np.float32)
+        else:
+            u_dist_host_reshaped = np.zeros((0, u_nom.shape[0], u_nom.shape[1]), dtype=np.float32)
+            u_weights_host = np.zeros(0, dtype=np.float32)
         record_timing("host_output_init")
 
         costmap_gpu = None
@@ -2546,6 +2928,14 @@ class MPPI:
         occupancy_costs_gpu = None
         oce_cost_gpu = None
         owned_oce_cost_gpu = None
+        owned_occluded_mass_gpu = None
+        target_means_gpu = None
+        distance_costs_gpu = None
+        visibility_costs_gpu = None
+        reduced_components_gpu = None
+        weight_square_sum_gpu = None
+        pre_static_weight_total_gpu = None
+        applied_toe_scale = 0.0
 
         with _active_cuda_context(self.mppi_context):
             try:
@@ -2627,8 +3017,8 @@ class MPPI:
                 self.last_num_polygon_obstacles = int(num_polygon_obstacles)
                 if self.debug and occupancy_payload is not None:
                     print(
-                        "[MPPI] using occupancy grid obstacle costs; "
-                        "legacy obstacle geometry disabled"
+                        "[MPPI] using occupancy grid obstacle costs with "
+                        "exact polygons and dynamic actors"
                     )
                 if self.debug and self.last_num_polygon_obstacles:
                     print(
@@ -2655,6 +3045,7 @@ class MPPI:
                     or scene_payload is not None
                     or discrete_oce_payload is not None
                     or occupancy_payload is not None
+                    or objective_data is not None
                     or bool(self.debug)
                 )
                 if need_rollout_trace:
@@ -2692,6 +3083,24 @@ class MPPI:
                 )
                 add_sample_costs_func = _COMPILED_MODULE.get_function(
                     "add_sample_costs"
+                )
+                add_scaled_sample_costs_func = _COMPILED_MODULE.get_function(
+                    "add_scaled_sample_costs"
+                )
+                add_distance_costs_func = _COMPILED_MODULE.get_function(
+                    "add_distance_costs"
+                )
+                add_skidsteer_control_costs_func = _COMPILED_MODULE.get_function(
+                    "add_skidsteer_control_costs"
+                )
+                reduce_objective_components_func = _COMPILED_MODULE.get_function(
+                    "reduce_objective_components"
+                )
+                combine_phase2_objective_func = _COMPILED_MODULE.get_function(
+                    "combine_phase2_objective"
+                )
+                reduce_weight_squares_func = _COMPILED_MODULE.get_function(
+                    "reduce_weight_squares"
                 )
                 min_weight_func = _COMPILED_MODULE.get_function("min_weight")
                 calculate_weights_func = _COMPILED_MODULE.get_function(
@@ -2814,12 +3223,169 @@ class MPPI:
                     )
                     record_timing("occupancy_cost_kernel", sync_cuda=True)
 
-                # BUGBUG - Disable OCE as the scoring is expensive over 1000's of rollouts - for
-                #          now, the diversity comes from the route planner.  MPPI can focus on
-                #          a local collision free path.
-                #
-                # self.last_oce_result = None
-                # if discrete_oce_payload is not None:
+                if objective_data is not None:
+                    target_means = np.ascontiguousarray(
+                        np.asarray(objective_data["target_means"], dtype=np.float32)
+                    )
+                    if target_means.shape != (num_controls_timesteps, 2):
+                        raise ValueError(
+                            "objective_data.target_means must have shape (num_controls, 2)"
+                        )
+                    target_means_gpu = _cuda.mem_alloc(target_means.nbytes)  # type: ignore[attr-defined]
+                    distance_costs_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
+                    visibility_costs_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
+                    _cuda.memcpy_htod(target_means_gpu, target_means)  # type: ignore[attr-defined]
+                    _cuda.memset_d8(distance_costs_gpu, 0, sample_cost_bytes)  # type: ignore[attr-defined]
+                    _cuda.memset_d8(visibility_costs_gpu, 0, sample_cost_bytes)  # type: ignore[attr-defined]
+                    add_distance_costs_func(
+                        rollout_states_gpu,
+                        target_means_gpu,
+                        self.samples,
+                        np.int32(num_controls_timesteps),
+                        np.float32(objective_data["desired_target_distance"]),
+                        np.float32(objective_data["distance_scale"]),
+                        np.float32(objective_data.get("inside_distance_multiplier", 1.0)),
+                        np.float32(objective_data.get("terminal_distance_multiplier", 0.0)),
+                        np.float32(objective_data.get("current_target_distance", 0.0)),
+                        np.float32(objective_data.get("inside_escape_penalty", 0.0)),
+                        distance_costs_gpu,
+                        u_weight_gpu,
+                        block=block_1d,
+                        grid=grid_1d,
+                    )
+                    record_timing("distance_cost_kernel", sync_cuda=True)
+                    add_skidsteer_control_costs_func(
+                        u_nom_gpu,
+                        u_dist_gpu,
+                        self.samples,
+                        np.int32(num_controls_timesteps),
+                        np.float32(objective_data["linear_control_scale"]),
+                        np.float32(objective_data["yaw_control_scale"]),
+                        np.float32(objective_data["yaw_slew_scale"]),
+                        component_costs_gpu,
+                        u_weight_gpu,
+                        block=block_1d,
+                        grid=grid_1d,
+                    )
+                    record_timing("control_cost_kernel", sync_cuda=True)
+
+                self.last_oce_result = None
+                if discrete_oce_payload is not None:
+                    if evaluate_discrete_oce_rollouts_gpu is None:
+                        raise RuntimeError(
+                            "Discrete OCE weighting was requested, but the PyCUDA "
+                            "discrete OCE evaluator could not be imported: "
+                            f"{_discrete_oce_import_error}"
+                        )
+                    discrete_inputs = _prepare_discrete_oce_rollout_inputs(
+                        discrete_oce_payload,
+                        num_controls_timesteps,
+                    )
+                    if discrete_inputs is not None:
+                        discrete_horizon = min(
+                            int(discrete_inputs["horizon"]),
+                            int(num_controls_timesteps),
+                        )
+                        oce_result = evaluate_discrete_oce_rollouts_gpu(
+                            rollout_states_d=rollout_states_gpu,
+                            num_rollouts=int(self.samples),
+                            x_init=np.asarray(x_init, dtype=np.float32),
+                            rollout_state_stride=4,
+                            rollout_path_steps=num_controls_timesteps,
+                            rollout_step_stride=discrete_inputs[
+                                "rollout_step_stride"
+                            ],
+                            state_centers=discrete_inputs["state_centers"],
+                            static_grid=discrete_inputs["static_grid"],
+                            grid_origin=discrete_inputs["grid_origin"],
+                            grid_resolution=discrete_inputs["grid_resolution"],
+                            transition_data=discrete_inputs["transition_data"],
+                            transition_indices=discrete_inputs["transition_indices"],
+                            transition_indptr=discrete_inputs["transition_indptr"],
+                            prefix_beliefs=discrete_inputs["prefix_beliefs"][
+                                :, : discrete_horizon + 1, :
+                            ],
+                            beliefs=discrete_inputs["beliefs"],
+                            horizon=discrete_horizon,
+                            scan_range=discrete_inputs["scan_range"],
+                            field_of_view_degrees=discrete_inputs["field_of_view_degrees"],
+                            next_sensor_step=discrete_inputs["next_sensor_step"],
+                            sensing_interval=discrete_inputs["sensing_interval"],
+                            planning_speed=discrete_inputs["planning_speed"],
+                            transition_steps=discrete_inputs["transition_steps"],
+                            visibility_representatives=discrete_inputs[
+                                "visibility_representatives"
+                            ],
+                            return_visibility=discrete_inputs["return_visibility"],
+                            occupancy_probability_grids=discrete_inputs[
+                                "occupancy_probability_grids"
+                            ],
+                            occupancy_owner_mask_grids=discrete_inputs[
+                                "occupancy_owner_mask_grids"
+                            ],
+                            agent_owner_bits=discrete_inputs["agent_owner_bits"],
+                            occupancy_threshold=discrete_inputs["occupancy_threshold"],
+                            return_device_scores=True,
+                            scoring_mode=discrete_inputs["scoring_mode"],
+                            materialize_scores=False,
+                            terminal_occluded_only=discrete_inputs[
+                                "terminal_occluded_only"
+                            ],
+                        )
+                        if getattr(oce_result, "metadata", None) is not None:
+                            oce_result.metadata["state_reduction"] = discrete_inputs[
+                                "state_reduction"
+                            ]
+                        self.last_oce_result = oce_result
+                        information_cost_gpu = getattr(
+                            oce_result, "device_scores", None
+                        )
+                        if information_cost_gpu is None:
+                            raise RuntimeError(
+                                "Discrete information scoring did not return a "
+                                "device score buffer."
+                            )
+                        scoring_mode = discrete_inputs["scoring_mode"]
+                        if scoring_mode == "visibility":
+                            # The visibility-only evaluator returns normalized
+                            # horizon-mean expected hidden mass. Keep it in the
+                            # VIS component and leave TOE exactly zero.
+                            owned_occluded_mass_gpu = information_cost_gpu
+                            add_scaled_sample_costs_func(
+                                visibility_costs_gpu,
+                                information_cost_gpu,
+                                np.float32(
+                                    float(
+                                        objective_data.get("visibility_scale", 0.0)
+                                    )
+                                ),
+                                self.samples,
+                                block=block_1d,
+                                grid=grid_1d,
+                            )
+                            oce_cost_gpu = None
+                        else:
+                            oce_cost_gpu = information_cost_gpu
+                            owned_oce_cost_gpu = oce_cost_gpu
+                        toe_scale = 0.0
+                        if objective_data is not None and scoring_mode != "visibility":
+                            selected_states = discrete_inputs["state_reduction"][
+                                "selected_states"
+                            ]
+                            toe_scale = float(
+                                objective_data.get("toe_weight", 1.0)
+                            ) / max(float(np.log(max(selected_states, 2))), 1.0e-8)
+                        if oce_cost_gpu is not None:
+                            add_scaled_sample_costs_func(
+                                u_weight_gpu,
+                                oce_cost_gpu,
+                                np.float32(toe_scale),
+                                self.samples,
+                                block=block_1d,
+                                grid=grid_1d,
+                            )
+                        applied_toe_scale = toe_scale
+                    record_timing("oce_scoring", sync_cuda=True)
                 #     if evaluate_discrete_oce_rollouts_gpu is None:
                 #         raise RuntimeError(
                 #             "Discrete OCE weighting was requested, but the PyCUDA "
@@ -2961,14 +3527,40 @@ class MPPI:
                 #         )
                 #     record_timing("oce_scoring", sync_cuda=True)
 
+                if objective_data is not None:
+                    combine_phase2_objective_func(
+                        self.samples,
+                        component_costs_gpu,
+                        oce_cost_gpu if oce_cost_gpu is not None else np.intp(0),
+                        (
+                            distance_costs_gpu
+                            if distance_costs_gpu is not None
+                            else np.intp(0)
+                        ),
+                        (
+                            visibility_costs_gpu
+                            if visibility_costs_gpu is not None
+                            else np.intp(0)
+                        ),
+                        dynamic_costs_gpu if dynamic_costs_gpu is not None else np.intp(0),
+                        (
+                            occupancy_costs_gpu
+                            if occupancy_costs_gpu is not None
+                            else np.intp(0)
+                        ),
+                        np.float32(objective_data["nominal_scale"]),
+                        np.float32(objective_data.get("ring_scale", 0.0)),
+                        np.float32(applied_toe_scale),
+                        u_weight_gpu,
+                        block=block_1d,
+                        grid=grid_1d,
+                    )
+                    record_timing("objective_combine_kernel", sync_cuda=True)
+
                 combined_costs_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
                 _cuda.memcpy_dtod(combined_costs_gpu, u_weight_gpu, sample_cost_bytes)  # type: ignore[attr-defined]
 
                 # Capture raw costs before weight transform
-                raw_costs_host = np.zeros(self.samples, dtype=np.float32)
-                _cuda.memcpy_dtoh(raw_costs_host, combined_costs_gpu)  # type: ignore[attr-defined]
-                record_timing("raw_cost_snapshot")
-
                 # Find min cost
                 u_weight_min_gpu = _cuda.mem_alloc(np.dtype(np.float32).itemsize)  # type: ignore[attr-defined]
                 large_float_val = np.array([np.finfo(np.float32).max], dtype=np.float32)
@@ -3000,8 +3592,16 @@ class MPPI:
                 self.last_dynamic_filter_all_invalid = False
                 if num_polygon_obstacles > 0:
                     pre_static_weight_gpu = _cuda.mem_alloc(sample_cost_bytes)  # type: ignore[attr-defined]
+                    pre_static_weight_total_gpu = _cuda.mem_alloc(  # type: ignore[attr-defined]
+                        np.dtype(np.float32).itemsize
+                    )
                     _cuda.memcpy_dtod(
                         pre_static_weight_gpu, u_weight_gpu, sample_cost_bytes
+                    )  # type: ignore[attr-defined]
+                    _cuda.memcpy_dtod(
+                        pre_static_weight_total_gpu,
+                        u_weight_total_gpu,
+                        np.dtype(np.float32).itemsize,
                     )  # type: ignore[attr-defined]
                     _cuda.memset_d8(
                         u_weight_total_gpu, 0, np.dtype(np.float32).itemsize
@@ -3020,24 +3620,20 @@ class MPPI:
                     _cuda.memcpy_dtoh(static_weight_total, u_weight_total_gpu)  # type: ignore[attr-defined]
                     record_timing("static_weight_total_download")
                     if float(static_weight_total[0]) <= 0.0:
-                        pre_static_weights_host = np.zeros(
-                            self.samples, dtype=np.float32
-                        )
+                        restored_total = np.zeros(1, dtype=np.float32)
                         _cuda.memcpy_dtoh(
-                            pre_static_weights_host, pre_static_weight_gpu
+                            restored_total, pre_static_weight_total_gpu
                         )  # type: ignore[attr-defined]
-                        restored_total = np.array(
-                            [np.sum(pre_static_weights_host, dtype=np.float32)],
-                            dtype=np.float32,
-                        )
                         if float(restored_total[0]) > 0.0:
                             _cuda.memcpy_dtod(
                                 u_weight_gpu,
                                 pre_static_weight_gpu,
                                 sample_cost_bytes,
                             )  # type: ignore[attr-defined]
-                            _cuda.memcpy_htod(
-                                u_weight_total_gpu, restored_total
+                            _cuda.memcpy_dtod(
+                                u_weight_total_gpu,
+                                pre_static_weight_total_gpu,
+                                np.dtype(np.float32).itemsize,
                             )  # type: ignore[attr-defined]
                             self.last_static_filter_all_invalid = True
                         record_timing("static_weight_filter_restore")
@@ -3079,6 +3675,62 @@ class MPPI:
                         )  # type: ignore[attr-defined]
                         self.last_dynamic_filter_all_invalid = True
                         record_timing("dynamic_weight_filter_restore")
+
+                reduced_components_gpu = _cuda.mem_alloc(  # type: ignore[attr-defined]
+                    6 * np.dtype(np.float32).itemsize
+                )
+                _cuda.memset_d8(
+                    reduced_components_gpu, 0, 6 * np.dtype(np.float32).itemsize
+                )  # type: ignore[attr-defined]
+                reduce_objective_components_func(
+                    self.samples,
+                    component_costs_gpu,
+                    oce_cost_gpu if oce_cost_gpu is not None else np.intp(0),
+                    (
+                        distance_costs_gpu
+                        if distance_costs_gpu is not None
+                        else np.intp(0)
+                    ),
+                    (
+                        visibility_costs_gpu
+                        if visibility_costs_gpu is not None
+                        else np.intp(0)
+                    ),
+                    dynamic_costs_gpu if dynamic_costs_gpu is not None else np.intp(0),
+                    (
+                        occupancy_costs_gpu
+                        if occupancy_costs_gpu is not None
+                        else np.intp(0)
+                    ),
+                    np.float32(
+                        objective_data.get("nominal_scale", 1.0)
+                        if objective_data is not None
+                        else 1.0
+                    ),
+                    np.float32(
+                        objective_data.get("ring_scale", 0.0)
+                        if objective_data is not None
+                        else 0.0
+                    ),
+                    np.float32(applied_toe_scale),
+                    reduced_components_gpu,
+                    block=block_1d,
+                    grid=grid_1d,
+                )
+                weight_square_sum_gpu = _cuda.mem_alloc(  # type: ignore[attr-defined]
+                    np.dtype(np.float32).itemsize
+                )
+                _cuda.memset_d8(
+                    weight_square_sum_gpu, 0, np.dtype(np.float32).itemsize
+                )  # type: ignore[attr-defined]
+                reduce_weight_squares_func(
+                    self.samples,
+                    u_weight_gpu,
+                    weight_square_sum_gpu,
+                    block=block_1d,
+                    grid=grid_1d,
+                )
+                record_timing("diagnostic_reduction_kernel", sync_cuda=True)
 
                 # Accumulate bounded scalar controls (Ackermann and skid-steer)
                 # independently in unconstrained space. This avoids biasing a
@@ -3136,17 +3788,18 @@ class MPPI:
                     )
                 record_timing("control_download")
 
-                u_dist_raw_host = np.zeros(
-                    self.samples * num_controls_timesteps * num_control_elements,
-                    dtype=np.float32,
-                )
-                _cuda.memcpy_dtoh(u_dist_raw_host, u_dist_gpu)  # type: ignore[attr-defined]
-                u_dist_host_reshaped = u_dist_raw_host.reshape(
-                    (self.samples, num_controls_timesteps, num_control_elements)
-                )
-                record_timing("disturbance_download")
-                _cuda.memcpy_dtoh(u_weights_host, u_weight_gpu)  # type: ignore[attr-defined]
-                record_timing("weights_download")
+                if materialize_rollout_diagnostics:
+                    u_dist_raw_host = np.zeros(
+                        self.samples * num_controls_timesteps * num_control_elements,
+                        dtype=np.float32,
+                    )
+                    _cuda.memcpy_dtoh(u_dist_raw_host, u_dist_gpu)  # type: ignore[attr-defined]
+                    u_dist_host_reshaped = u_dist_raw_host.reshape(
+                        (self.samples, num_controls_timesteps, num_control_elements)
+                    )
+                    record_timing("disturbance_download")
+                    _cuda.memcpy_dtoh(u_weights_host, u_weight_gpu)  # type: ignore[attr-defined]
+                    record_timing("weights_download")
                 if rollout_states_gpu is not None and self.debug:
                     rollout_states_host = np.zeros(
                         (self.samples, num_controls_timesteps, 4), dtype=np.float32
@@ -3156,41 +3809,36 @@ class MPPI:
                 else:
                     self.last_rollout_states = None
                 record_timing("rollout_states_download")
-                combined_costs_host = np.zeros(self.samples, dtype=np.float32)
-                _cuda.memcpy_dtoh(combined_costs_host, combined_costs_gpu)  # type: ignore[attr-defined]
-                oce_costs_host = np.zeros(self.samples, dtype=np.float32)
-                if oce_cost_gpu is not None:
-                    _cuda.memcpy_dtoh(oce_costs_host, oce_cost_gpu)  # type: ignore[attr-defined]
-                component_costs_host = np.zeros(
-                    (int(self.samples), 5), dtype=np.float32
-                )
-                if component_costs_gpu is not None:
-                    _cuda.memcpy_dtoh(component_costs_host, component_costs_gpu)  # type: ignore[attr-defined]
-                dynamic_costs_host = np.zeros(self.samples, dtype=np.float32)
-                if dynamic_costs_gpu is not None:
-                    _cuda.memcpy_dtoh(dynamic_costs_host, dynamic_costs_gpu)  # type: ignore[attr-defined]
-                    component_costs_host[:, 4] = dynamic_costs_host
-                occupancy_costs_host = np.zeros(self.samples, dtype=np.float32)
-                if occupancy_costs_gpu is not None:
-                    _cuda.memcpy_dtoh(occupancy_costs_host, occupancy_costs_gpu)  # type: ignore[attr-defined]
-                record_timing("cost_components_download")
+                reduced_components_host = np.zeros(6, dtype=np.float32)
+                weight_total_host = np.zeros(1, dtype=np.float32)
+                weight_square_sum_host = np.zeros(1, dtype=np.float32)
+                _cuda.memcpy_dtoh(reduced_components_host, reduced_components_gpu)  # type: ignore[attr-defined]
+                _cuda.memcpy_dtoh(weight_total_host, u_weight_total_gpu)  # type: ignore[attr-defined]
+                _cuda.memcpy_dtoh(weight_square_sum_host, weight_square_sum_gpu)  # type: ignore[attr-defined]
+                record_timing("reduced_diagnostics_download")
 
                 # Diagnostics
-                weight_sum = float(np.sum(u_weights_host) + 1e-12)
-                ess = (weight_sum**2) / (float(np.sum(u_weights_host**2)) + 1e-12)
-                self.last_ess = ess
-                self.last_total_costs = combined_costs_host
-                self.last_oce_costs = oce_costs_host
-                self.last_rollout_costs = combined_costs_host - oce_costs_host
-                self.last_dynamic_costs = dynamic_costs_host
-                self.last_cost_components = {
-                    "state": component_costs_host[:, 0],
-                    "control": component_costs_host[:, 1],
-                    "static_obstacle": component_costs_host[:, 2],
-                    "visibility": component_costs_host[:, 3],
-                    "dynamic_obstacle": component_costs_host[:, 4],
-                    "oce": oce_costs_host,
-                    "occupancy": occupancy_costs_host,
+                if materialize_rollout_diagnostics:
+                    weight_sum = float(np.sum(u_weights_host) + 1e-12)
+                    ess = (weight_sum**2) / (float(np.sum(u_weights_host**2)) + 1e-12)
+                    self.last_ess = ess
+                else:
+                    self.last_ess = float(
+                        weight_total_host[0] ** 2
+                        / max(float(weight_square_sum_host[0]), 1.0e-12)
+                    )
+                self.last_total_costs = None
+                self.last_oce_costs = None
+                self.last_rollout_costs = None
+                self.last_dynamic_costs = None
+                self.last_cost_components = None
+                self.last_cost_component_means = {
+                    "nominal": float(reduced_components_host[0]),
+                    "toe": float(reduced_components_host[1]),
+                    "distance": float(reduced_components_host[2]),
+                    "ring": float(reduced_components_host[3]),
+                    "visibility": float(reduced_components_host[4]),
+                    "mppi": float(reduced_components_host[5]),
                 }
                 self.last_dynamic_clearance_summary = None
                 # if (
@@ -3283,13 +3931,20 @@ class MPPI:
                     combined_costs_gpu,
                     component_costs_gpu,
                     pre_static_weight_gpu,
+                    pre_static_weight_total_gpu,
                     pre_dynamic_weight_gpu,
                     dynamic_costs_gpu,
                     dynamic_actor_states_gpu,
                     dynamic_actor_geometry_gpu,
                     occupancy_grids_gpu,
                     occupancy_costs_gpu,
+                    target_means_gpu,
+                    distance_costs_gpu,
+                    visibility_costs_gpu,
+                    reduced_components_gpu,
+                    weight_square_sum_gpu,
                     owned_oce_cost_gpu,
+                    owned_occluded_mass_gpu,
                     u_weight_min_gpu,
                     u_weight_total_gpu,
                 ]:

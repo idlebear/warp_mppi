@@ -8,6 +8,7 @@ callers can fall back to the CPU oracle.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 from dataclasses import dataclass
 from functools import lru_cache
@@ -28,6 +29,7 @@ except Exception:  # pragma: no cover - depends on local CUDA install
 
 TOLERANCE = 1.0e-10
 DISCRETE_OCE_SCORING_MODES = {
+    "visibility",
     "entropy",
     "oc_entropy",
     "entropy_plus_information",
@@ -47,6 +49,7 @@ class DiscreteOCEResult:
     best_trajectory: int
     scores: np.ndarray
     device_scores: Any | None = None
+    device_occluded_mass: Any | None = None
     step_entropy: np.ndarray | None = None
     step_probability: np.ndarray | None = None
     step_e_state: np.ndarray | None = None
@@ -108,6 +111,11 @@ def score_discrete_oce_components(
     max_spatial_separation: float = 1.0,
 ) -> np.ndarray:
     scoring_mode = normalize_discrete_oce_scoring_mode(scoring_mode)
+    if scoring_mode == "visibility":
+        raise ValueError(
+            "visibility scoring is a device-only rollout path and is not "
+            "available through score_discrete_oce_components"
+        )
     step_entropy = np.asarray(step_entropy, dtype=np.float32)
     step_oc_entropy = np.asarray(step_oc_entropy, dtype=np.float32)
     step_e_state = np.asarray(step_e_state, dtype=np.float32)
@@ -179,6 +187,43 @@ def _pop_module_context_after_compile():
     if _module_context_pushed and _MODULE_CONTEXT is not None:
         _MODULE_CONTEXT.pop()
         _module_context_pushed = False
+
+
+def _drain_current_context_stack() -> None:
+    """Pop leaked contexts on the dedicated CUDA-owning worker thread."""
+    if not PYCUDA_AVAILABLE:
+        return
+    for _ in range(64):
+        try:
+            if cuda.Context.get_current() is None:
+                return
+            cuda.Context.pop()
+        except Exception:
+            return
+
+
+def close_discrete_oce_cuda() -> None:
+    """Release the retained discrete-OCE context reference deterministically."""
+    global _MODULE_CONTEXT, _owns_module_context_ref, _module_context_pushed
+    context = _MODULE_CONTEXT
+    if context is None:
+        return
+    try:
+        _compiled_module.cache_clear()
+        _drain_current_context_stack()
+        _module_context_pushed = False
+        if _owns_module_context_ref:
+            context.detach()
+    except Exception:
+        # CUDA may already be deinitialized when invoked by atexit.
+        pass
+    finally:
+        _MODULE_CONTEXT = None
+        _owns_module_context_ref = False
+        _module_context_pushed = False
+
+
+atexit.register(close_discrete_oce_cuda)
 
 
 @contextlib.contextmanager
@@ -359,6 +404,7 @@ __device__ int blocked_line_with_occupancy(
 __global__ void compute_discrete_occlusion(
     const float* paths,
     const float* state_centers,
+    const int* visibility_representatives,
     const unsigned char* static_grid,
     const float* occupancy_grids,
     const unsigned long long* owner_mask_grids,
@@ -387,6 +433,7 @@ __global__ void compute_discrete_occlusion(
     tmp /= horizon_plus_one;
     int agent = tmp % num_agents;
     int path = tmp / num_agents;
+    if (visibility_representatives[state] != state) return;
 
     float ox = paths[(path * horizon_plus_one + step) * 2 + 0];
     float oy = paths[(path * horizon_plus_one + step) * 2 + 1];
@@ -431,11 +478,14 @@ __global__ void compute_discrete_occlusion_from_rollouts(
     const float* rollout_states,
     const float* x_init,
     const float* state_centers,
+    const int* visibility_representatives,
     const unsigned char* static_grid,
     const float* occupancy_grids,
     const unsigned long long* owner_mask_grids,
     const unsigned long long* agent_owner_bits,
     int rollout_state_stride,
+    int rollout_path_steps,
+    int rollout_step_stride,
     int num_paths,
     int num_agents,
     int horizon_plus_one,
@@ -446,6 +496,7 @@ __global__ void compute_discrete_occlusion_from_rollouts(
     float origin_y,
     float resolution,
     float scan_range,
+    float field_of_view_radians,
     float occupancy_threshold,
     int occupancy_steps,
     unsigned char* occlusion
@@ -460,17 +511,22 @@ __global__ void compute_discrete_occlusion_from_rollouts(
     tmp /= horizon_plus_one;
     int agent = tmp % num_agents;
     int path = tmp / num_agents;
+    if (visibility_representatives[state] != state) return;
 
     float ox;
     float oy;
+    float observer_heading;
     if (step == 0) {
         ox = x_init[0];
         oy = x_init[1];
+        observer_heading = x_init[3];
     } else {
         const float* rollout_state =
-            rollout_states + (((long long)path * (horizon_plus_one - 1) + (step - 1)) * rollout_state_stride);
+            rollout_states + (((long long)path * rollout_path_steps
+                + step * rollout_step_stride - 1) * rollout_state_stride);
         ox = rollout_state[0];
         oy = rollout_state[1];
+        observer_heading = rollout_state[3];
     }
 
     float sx = state_centers[state * 2 + 0];
@@ -479,7 +535,12 @@ __global__ void compute_discrete_occlusion_from_rollouts(
     float dy = sy - oy;
     float dist2 = dx * dx + dy * dy;
     unsigned char occ = 0;
-    if (dist2 > scan_range * scan_range) {
+    float bearing_error = atan2f(sinf(atan2f(dy, dx) - observer_heading),
+                                 cosf(atan2f(dy, dx) - observer_heading));
+    if (field_of_view_radians < 2.0f * 3.14159265358979323846f - 1.0e-6f
+        && fabsf(bearing_error) > 0.5f * field_of_view_radians) {
+        occ = 1;
+    } else if (dist2 > scan_range * scan_range) {
         occ = 1;
     } else if (
         occupancy_grids != NULL
@@ -508,6 +569,19 @@ __global__ void compute_discrete_occlusion_from_rollouts(
         occ = 1;
     }
     occlusion[idx] = occ;
+}
+
+__global__ void expand_discrete_occlusion_groups(
+    const int* visibility_representatives,
+    int total,
+    int num_states,
+    unsigned char* occlusion
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int state = idx % num_states;
+    int representative = visibility_representatives[state];
+    occlusion[idx] = occlusion[idx - state + representative];
 }
 
 __device__ void dense_transition_step(
@@ -2530,6 +2604,105 @@ __global__ void discrete_exact_entropy_active_partition_scores_csr_score_only(
     }
 }
 
+// Terminal entropy of the branch which remains occluded at every scheduled
+// observation. Once a target is detected, the live estimator collapses its
+// posterior and replans, so post-detection branches do not belong in this
+// receding-horizon solve. One block per rollout also avoids constructing a
+// multi-million-entry active-partition list on the host.
+__global__ void discrete_terminal_occluded_entropy_scores_csr(
+    const float* transition_data,
+    const int* transition_indices,
+    const int* transition_indptr,
+    const float* prefix_beliefs,
+    const unsigned char* occlusion,
+    int num_paths,
+    int num_agents,
+    int horizon,
+    int num_states,
+    int next_sensor_step,
+    int sensing_interval,
+    int planning_speed,
+    const int* transition_steps,
+    float* path_scores
+) {
+    int task = blockIdx.x;
+    int tid = threadIdx.x;
+    int path = task / num_agents;
+    int agent = task % num_agents;
+    if (path >= num_paths) return;
+
+    extern __shared__ float shared[];
+    float* work = shared;
+    float* next = work + num_states;
+    float* scratch = next + num_states;
+    const float* belief0 =
+        prefix_beliefs + agent * (horizon + 1) * num_states;
+
+    for (int state = tid; state < num_states; state += blockDim.x) {
+        work[state] = belief0[state];
+    }
+    __syncthreads();
+
+    for (int step = 1; step <= horizon; ++step) {
+        csr_scheduled_transition_step(
+            transition_data, transition_indices, transition_indptr,
+            work, next, num_states, agent, step, planning_speed,
+            transition_steps
+        );
+        __syncthreads();
+        for (int state = tid; state < num_states; state += blockDim.x) {
+            int occ_idx = occlusion_offset(
+                path, agent, step, state, num_agents, horizon + 1, num_states
+            );
+            if (sensor_active_at_step(
+                    step, next_sensor_step, sensing_interval, planning_speed)) {
+                next[state] *= (float)occlusion[occ_idx];
+            }
+            work[state] = next[state];
+        }
+        __syncthreads();
+    }
+
+    float contribution = partition_entropy(work, num_states, scratch);
+    if (tid == 0 && contribution > 0.0f) {
+        atomicAdd(path_scores + path, contribution);
+    }
+}
+
+// Mean unconditional belief mass hidden at the scheduled observation stages.
+// This is a separate visibility objective; it deliberately does not reuse the
+// entropy value, and remains device resident for MPPI combination.
+__global__ void discrete_expected_occluded_mass(
+    const float* prefix_beliefs,
+    const unsigned char* occlusion,
+    int num_paths,
+    int num_agents,
+    int horizon,
+    int num_states,
+    float* path_costs
+) {
+    int path = blockIdx.x * blockDim.x + threadIdx.x;
+    if (path >= num_paths) return;
+    float total = 0.0f;
+    for (int agent = 0; agent < num_agents; ++agent) {
+        const float* prefix_agent =
+            prefix_beliefs + agent * (horizon + 1) * num_states;
+        for (int step = 1; step <= horizon; ++step) {
+            float hidden = 0.0f;
+            for (int state = 0; state < num_states; ++state) {
+                int occ_idx = occlusion_offset(
+                    path, agent, step, state,
+                    num_agents, horizon + 1, num_states
+                );
+                hidden += prefix_agent[step * num_states + state]
+                    * (float)occlusion[occ_idx];
+            }
+            total += hidden;
+        }
+    }
+    path_costs[path] = total / fmaxf((float)(num_agents * horizon), 1.0f);
+}
+
 } // extern "C"
 """
 
@@ -2539,9 +2712,12 @@ def _compiled_module():
     if not PYCUDA_AVAILABLE:
         raise RuntimeError("PyCUDA is not available for discrete OCE CUDA execution.")
     context = _establish_module_context()
-    with _active_cuda_context(context):
-        module = SourceModule(CUDA_SOURCE, options=["--use_fast_math"])
-    _pop_module_context_after_compile()
+    try:
+        with _active_cuda_context(context):
+            module = SourceModule(CUDA_SOURCE, options=["--use_fast_math"])
+    finally:
+        # The first establishment push must be balanced even if NVCC fails.
+        _pop_module_context_after_compile()
     return module
 
 
@@ -2735,6 +2911,8 @@ def _evaluate_discrete_oce_gpu_impl(
     num_rollouts: int | None = None,
     x_init: np.ndarray | None = None,
     rollout_state_stride: int = 4,
+    rollout_path_steps: int | None = None,
+    rollout_step_stride: int = 1,
     state_centers: np.ndarray,
     state_coords: np.ndarray | None = None,
     static_grid: np.ndarray,
@@ -2751,10 +2929,12 @@ def _evaluate_discrete_oce_gpu_impl(
     mode_agent_counts: np.ndarray | None = None,
     horizon: int,
     scan_range: float,
+    field_of_view_degrees: float = 360.0,
     next_sensor_step: int = 0,
     sensing_interval: int = 1,
     planning_speed: int = 1,
     transition_steps: np.ndarray | None = None,
+    visibility_representatives: np.ndarray | None = None,
     return_visibility: bool = False,
     return_belief_sums: bool = False,
     occupancy_probability_grids: np.ndarray | None = None,
@@ -2762,7 +2942,9 @@ def _evaluate_discrete_oce_gpu_impl(
     agent_owner_bits: np.ndarray | None = None,
     occupancy_threshold: float = 0.25,
     return_device_scores: bool = False,
+    materialize_scores: bool = True,
     compact_active_partitions: bool = True,
+    terminal_occluded_only: bool = False,
     entropy_method: str = "discrete_exact_entropy",
     scoring_mode: str = "information_only",
     separation_metric: str = "geo",
@@ -2773,6 +2955,9 @@ def _evaluate_discrete_oce_gpu_impl(
     scan_range = float(scan_range)
     if scan_range < 0.0:
         scan_range = 1.0e9
+    field_of_view_degrees = float(field_of_view_degrees)
+    if not np.isfinite(field_of_view_degrees) or not 0.0 < field_of_view_degrees <= 360.0:
+        raise ValueError("field_of_view_degrees must be in (0, 360]")
 
     if paths is not None and rollout_states_d is not None:
         raise ValueError("provide either paths or rollout_states_d, not both")
@@ -2791,8 +2976,12 @@ def _evaluate_discrete_oce_gpu_impl(
         rollout_state_stride = int(rollout_state_stride)
         if rollout_state_stride < 2:
             raise ValueError("rollout_state_stride must be at least 2")
+        rollout_step_stride = int(rollout_step_stride)
+        if rollout_step_stride <= 0:
+            raise ValueError("rollout_step_stride must be positive")
     requested_entropy_method = str(entropy_method or "discrete_exact_entropy").lower()
     scoring_mode = normalize_discrete_oce_scoring_mode(scoring_mode)
+    visibility_only = scoring_mode == "visibility"
     separation_metric = normalize_discrete_oce_separation_metric(separation_metric)
     next_sensor_step, sensing_interval, planning_speed = _validate_sensor_schedule(
         next_sensor_step=next_sensor_step,
@@ -2904,6 +3093,13 @@ def _evaluate_discrete_oce_gpu_impl(
         num_paths = int(num_rollouts)
         horizon = int(horizon)
         horizon_plus_one = horizon + 1
+        if rollout_path_steps is None:
+            rollout_path_steps = horizon * rollout_step_stride
+        rollout_path_steps = int(rollout_path_steps)
+        if rollout_path_steps < horizon * rollout_step_stride:
+            raise ValueError(
+                "rollout_path_steps must cover horizon * rollout_step_stride"
+            )
     if transition_steps is None:
         transition_steps = np.asarray(
             [
@@ -2922,6 +3118,25 @@ def _evaluate_discrete_oce_gpu_impl(
                 "outer trajectory step"
             )
     num_states = int(state_centers.shape[0])
+    if visibility_representatives is None:
+        visibility_representatives = np.arange(num_states, dtype=np.int32)
+    else:
+        visibility_representatives = np.ascontiguousarray(
+            np.asarray(visibility_representatives, dtype=np.int32).reshape(-1)
+        )
+        if visibility_representatives.shape != (num_states,):
+            raise ValueError(
+                "visibility_representatives must have shape (num_states,)"
+            )
+        if np.any(visibility_representatives < 0) or np.any(
+            visibility_representatives >= num_states
+        ):
+            raise ValueError("visibility representatives are out of range")
+        if np.any(
+            visibility_representatives[visibility_representatives]
+            != visibility_representatives
+        ):
+            raise ValueError("visibility representatives must reference themselves")
     if state_coords is not None and int(state_coords.shape[0]) != num_states:
         raise ValueError("state_coords dimensions do not match state_centers")
     num_agents = int(beliefs.shape[0])
@@ -3003,6 +3218,8 @@ def _evaluate_discrete_oce_gpu_impl(
 
     # BUGBUG - score_only mode is only available for exact_entropy at this time
     score_only = bool(
+        visibility_only
+        or (
         not use_approximate_entropy
         and return_device_scores
         and use_csr
@@ -3010,7 +3227,14 @@ def _evaluate_discrete_oce_gpu_impl(
         and not return_visibility
         and not return_belief_sums
         and not use_jsd_separation
+        )
     )
+    terminal_occluded_only = bool(terminal_occluded_only)
+    if terminal_occluded_only and not score_only:
+        raise ValueError(
+            "terminal_occluded_only requires CSR transitions, exact entropy, "
+            "device scores, and no host visibility/detail materialization"
+        )
 
     if agent_owner_bits is None:
         agent_owner_bits = np.zeros((num_agents,), dtype=np.uint64)
@@ -3097,7 +3321,14 @@ def _evaluate_discrete_oce_gpu_impl(
         if paths is not None
         else "compute_discrete_occlusion_from_rollouts"
     )
-    if use_jsd_separation:
+    expand_occ = module.get_function("expand_discrete_occlusion_groups")
+    expected_occluded_mass_kernel = module.get_function(
+        "discrete_expected_occluded_mass"
+    )
+    if visibility_only:
+        score_kernel = None
+        finalize_kernel = None
+    elif use_jsd_separation:
         if use_approximate_entropy:
             score_kernel_name = (
                 "discrete_combined_jsd_approximate_partition_scores_csr"
@@ -3116,6 +3347,8 @@ def _evaluate_discrete_oce_gpu_impl(
             if use_csr
             else "discrete_approximate_entropy_partition_scores"
         )
+    elif terminal_occluded_only:
+        score_kernel_name = "discrete_terminal_occluded_entropy_scores_csr"
     elif score_only:
         score_kernel_name = (
             "discrete_exact_entropy_active_partition_scores_csr_score_only"
@@ -3126,8 +3359,9 @@ def _evaluate_discrete_oce_gpu_impl(
         score_kernel_name = "discrete_exact_entropy_partition_scores_csr"
     else:
         score_kernel_name = "discrete_exact_entropy_partition_scores"
-    score_kernel = module.get_function(score_kernel_name)
-    finalize_kernel = module.get_function("finalize_discrete_entropy_details")
+    if not visibility_only:
+        score_kernel = module.get_function(score_kernel_name)
+        finalize_kernel = module.get_function("finalize_discrete_entropy_details")
 
     context = _establish_module_context()
     with _active_cuda_context(context):
@@ -3161,6 +3395,9 @@ def _evaluate_discrete_oce_gpu_impl(
             paths_d = None
             x_init_d = _alloc_and_copy(x_init[:4] if x_init.size >= 4 else x_init[:2])
         centers_d = _alloc_and_copy(state_centers)
+        visibility_representatives_d = _alloc_and_copy(
+            visibility_representatives
+        )
         state_coords_d = (
             _alloc_and_copy(state_coords) if state_coords is not None else np.intp(0)
         )
@@ -3197,6 +3434,7 @@ def _evaluate_discrete_oce_gpu_impl(
         occlusion_d = cuda.mem_alloc(occlusion.nbytes)
         scores = np.zeros((num_paths,), dtype=np.float32)
         scores_d = _alloc_and_copy(scores)
+        occluded_mass_d = _alloc_and_copy(scores)
         detail_shape = (num_paths, num_detail_agents, horizon)
         detail_size = num_paths * num_detail_agents * horizon
         if score_only:
@@ -3234,6 +3472,7 @@ def _evaluate_discrete_oce_gpu_impl(
             compute_occ(
                 paths_d,
                 centers_d,
+                visibility_representatives_d,
                 static_d,
                 occupancy_d,
                 owner_masks_d,
@@ -3259,11 +3498,14 @@ def _evaluate_discrete_oce_gpu_impl(
                 rollout_states_d,
                 x_init_d,
                 centers_d,
+                visibility_representatives_d,
                 static_d,
                 occupancy_d,
                 owner_masks_d,
                 agent_owner_bits_d,
                 np.int32(rollout_state_stride),
+                np.int32(rollout_path_steps),
+                np.int32(rollout_step_stride),
                 np.int32(num_paths),
                 np.int32(num_agents),
                 np.int32(horizon + 1),
@@ -3274,11 +3516,63 @@ def _evaluate_discrete_oce_gpu_impl(
                 np.float32(grid_origin[1]),
                 np.float32(grid_resolution),
                 np.float32(scan_range),
+                np.float32(np.deg2rad(field_of_view_degrees)),
                 np.float32(occupancy_threshold),
                 np.int32(occupancy_steps),
                 occlusion_d,
                 block=(block, 1, 1),
                 grid=grid,
+            )
+
+        expand_occ(
+            visibility_representatives_d,
+            np.int32(occ_size),
+            np.int32(num_states),
+            occlusion_d,
+            block=(block, 1, 1),
+            grid=grid,
+        )
+        path_grid = ((num_paths + block - 1) // block, 1, 1)
+        expected_occluded_mass_kernel(
+            prefix_d,
+            occlusion_d,
+            np.int32(num_paths),
+            np.int32(num_agents),
+            np.int32(horizon),
+            np.int32(num_states),
+            occluded_mass_d,
+            block=(block, 1, 1),
+            grid=path_grid,
+        )
+
+        # VIS needs only the horizon-mean expected hidden belief mass. Return
+        # that device buffer before configuring or launching any entropy
+        # partition kernels, and do not materialize per-rollout scores.
+        if visibility_only:
+            return DiscreteOCEResult(
+                best_trajectory=0,
+                scores=np.zeros((0,), dtype=np.float32),
+                device_scores=occluded_mass_d if return_device_scores else None,
+                device_occluded_mass=occluded_mass_d if return_device_scores else None,
+                execution_path="cuda_discrete_visibility_only",
+                metadata={
+                    "active_partitions": 0,
+                    "score_blocks": 0,
+                    "score_only": True,
+                    "visibility_only": True,
+                    "entropy_evaluated": False,
+                    "entropy_method": None,
+                    "requested_entropy_method": requested_entropy_method,
+                    "scoring_mode": scoring_mode,
+                    "num_mode_rows": num_agents,
+                    "num_target_groups": num_detail_agents,
+                    "next_sensor_step": next_sensor_step,
+                    "sensing_interval": sensing_interval,
+                    "planning_speed": planning_speed,
+                    "transition_step_sum": int(transition_steps.sum()),
+                    "transition_step_min": int(transition_steps.min()),
+                    "transition_step_max": int(transition_steps.max()),
+                },
             )
 
         if use_jsd_separation:
@@ -3425,6 +3719,29 @@ def _evaluate_discrete_oce_gpu_impl(
                     grid=score_grid,
                     shared=score_shared,
                 )
+        elif terminal_occluded_only:
+            score_grid = (num_paths * num_agents, 1, 1)
+            score_block_count = int(score_grid[0])
+            num_active_partitions = 0
+            score_kernel(
+                transition_data_d,
+                transition_indices_d,
+                transition_indptr_d,
+                prefix_d,
+                occlusion_d,
+                np.int32(num_paths),
+                np.int32(num_agents),
+                np.int32(horizon),
+                np.int32(num_states),
+                np.int32(next_sensor_step),
+                np.int32(sensing_interval),
+                np.int32(planning_speed),
+                transition_steps_d,
+                scores_d,
+                block=(block, 1, 1),
+                grid=score_grid,
+                shared=score_shared,
+            )
         else:
             # Exact entropy either compacts active seen-state partitions for CSR
             # or launches the full per-state partition grid.
@@ -3586,10 +3903,12 @@ def _evaluate_discrete_oce_gpu_impl(
                         shared=score_shared,
                     )
 
-        cuda.memcpy_dtoh(scores, scores_d)
+        if materialize_scores:
+            cuda.memcpy_dtoh(scores, scores_d)
         step_belief_sums = None
         # score_components = None
         step_total_entropy = None
+        step_total_oc_entropy = None
         public_step_entropy = None
         public_step_probability = None
         public_step_oc_entropy = None
@@ -3597,6 +3916,7 @@ def _evaluate_discrete_oce_gpu_impl(
         public_step_e_state = None
         public_step_spatial_separation = None
         public_step_total_entropy = None
+        public_step_total_oc_entropy = None
         if not score_only:
             finalize_shared = int(block * np.dtype(np.float32).itemsize)
             _configure_dynamic_shared_memory(
@@ -3717,6 +4037,9 @@ def _evaluate_discrete_oce_gpu_impl(
         best_trajectory=best,
         scores=scores,
         device_scores=scores_d if return_device_scores else None,
+        device_occluded_mass=(
+            occluded_mass_d if return_device_scores else None
+        ),
         step_entropy=public_step_entropy,
         step_probability=public_step_probability,
         step_e_state=public_step_e_state,
@@ -3738,7 +4061,9 @@ def _evaluate_discrete_oce_gpu_impl(
         # score_components=public_score_components,
         visibility_tensor=visibility_tensor,
         execution_path=(
-            "cuda_discrete_exact_csr_score_only"
+            "cuda_discrete_terminal_occluded_csr_score_only"
+            if terminal_occluded_only
+            else "cuda_discrete_exact_csr_score_only"
             if score_only and use_csr
             else (
                 (
@@ -3758,6 +4083,12 @@ def _evaluate_discrete_oce_gpu_impl(
             "active_partitions": num_active_partitions,
             "score_blocks": score_block_count,
             "score_only": score_only,
+            "terminal_occluded_only": terminal_occluded_only,
+            "visibility_state_count": int(
+                np.count_nonzero(
+                    visibility_representatives == np.arange(num_states)
+                )
+            ),
             "entropy_method": entropy_method,
             "requested_entropy_method": requested_entropy_method,
             "scoring_mode": scoring_mode,
@@ -3771,6 +4102,7 @@ def _evaluate_discrete_oce_gpu_impl(
             "transition_step_sum": int(transition_steps.sum()),
             "transition_step_min": int(transition_steps.min()),
             "transition_step_max": int(transition_steps.max()),
+            "scores_materialized": bool(materialize_scores),
         },
     )
 
@@ -3794,10 +4126,12 @@ def evaluate_discrete_oce_gpu(
     mode_agent_counts: np.ndarray | None = None,
     horizon: int,
     scan_range: float,
+    field_of_view_degrees: float = 360.0,
     next_sensor_step: int = 0,
     sensing_interval: int = 1,
     planning_speed: int = 1,
     transition_steps: np.ndarray | None = None,
+    visibility_representatives: np.ndarray | None = None,
     return_visibility: bool = False,
     return_belief_sums: bool = False,
     occupancy_probability_grids: np.ndarray | None = None,
@@ -3807,6 +4141,7 @@ def evaluate_discrete_oce_gpu(
     entropy_method: str = "discrete_exact_entropy",
     scoring_mode: str = "information_only",
     separation_metric: str = "geo",
+    materialize_scores: bool = True,
 ) -> DiscreteOCEResult:
     return _evaluate_discrete_oce_gpu_impl(
         paths=paths,
@@ -3826,10 +4161,12 @@ def evaluate_discrete_oce_gpu(
         mode_agent_counts=mode_agent_counts,
         horizon=horizon,
         scan_range=scan_range,
+        field_of_view_degrees=field_of_view_degrees,
         next_sensor_step=next_sensor_step,
         sensing_interval=sensing_interval,
         planning_speed=planning_speed,
         transition_steps=transition_steps,
+        visibility_representatives=visibility_representatives,
         return_visibility=return_visibility,
         return_belief_sums=return_belief_sums,
         occupancy_probability_grids=occupancy_probability_grids,
@@ -3839,6 +4176,7 @@ def evaluate_discrete_oce_gpu(
         entropy_method=entropy_method,
         scoring_mode=scoring_mode,
         separation_metric=separation_metric,
+        materialize_scores=materialize_scores,
     )
 
 
@@ -3848,6 +4186,8 @@ def evaluate_discrete_oce_rollouts_gpu(
     num_rollouts: int,
     x_init: np.ndarray,
     rollout_state_stride: int = 4,
+    rollout_path_steps: int | None = None,
+    rollout_step_stride: int = 1,
     state_centers: np.ndarray,
     state_coords: np.ndarray | None = None,
     static_grid: np.ndarray,
@@ -3864,10 +4204,12 @@ def evaluate_discrete_oce_rollouts_gpu(
     mode_agent_counts: np.ndarray | None = None,
     horizon: int,
     scan_range: float,
+    field_of_view_degrees: float = 360.0,
     next_sensor_step: int = 0,
     sensing_interval: int = 1,
     planning_speed: int = 1,
     transition_steps: np.ndarray | None = None,
+    visibility_representatives: np.ndarray | None = None,
     return_visibility: bool = False,
     return_belief_sums: bool = False,
     occupancy_probability_grids: np.ndarray | None = None,
@@ -3878,12 +4220,16 @@ def evaluate_discrete_oce_rollouts_gpu(
     entropy_method: str = "discrete_exact_entropy",
     scoring_mode: str = "information_only",
     separation_metric: str = "geo",
+    materialize_scores: bool = True,
+    terminal_occluded_only: bool = False,
 ) -> DiscreteOCEResult:
     return _evaluate_discrete_oce_gpu_impl(
         rollout_states_d=rollout_states_d,
         num_rollouts=num_rollouts,
         x_init=x_init,
         rollout_state_stride=rollout_state_stride,
+        rollout_path_steps=rollout_path_steps,
+        rollout_step_stride=rollout_step_stride,
         state_centers=state_centers,
         state_coords=state_coords,
         static_grid=static_grid,
@@ -3900,10 +4246,12 @@ def evaluate_discrete_oce_rollouts_gpu(
         mode_agent_counts=mode_agent_counts,
         horizon=horizon,
         scan_range=scan_range,
+        field_of_view_degrees=field_of_view_degrees,
         next_sensor_step=next_sensor_step,
         sensing_interval=sensing_interval,
         planning_speed=planning_speed,
         transition_steps=transition_steps,
+        visibility_representatives=visibility_representatives,
         return_visibility=return_visibility,
         return_belief_sums=return_belief_sums,
         occupancy_probability_grids=occupancy_probability_grids,
@@ -3912,7 +4260,9 @@ def evaluate_discrete_oce_rollouts_gpu(
         occupancy_threshold=occupancy_threshold,
         return_device_scores=return_device_scores,
         compact_active_partitions=True,
+        terminal_occluded_only=terminal_occluded_only,
         entropy_method=entropy_method,
         scoring_mode=scoring_mode,
         separation_metric=separation_metric,
+        materialize_scores=materialize_scores,
     )
